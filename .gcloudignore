@@ -1,0 +1,37 @@
+# This file specifies files that are *not* uploaded to Google Cloud Platform
+# using gcloud. It follows the same syntax as .gitignore.
+
+.gcloudignore
+.git
+.gitignore
+.github/
+
+# Node.js dependencies
+node_modules/
+
+# Build output (will be rebuilt in container)
+dist/
+
+# Test files
+test/
+*.test.ts
+*.spec.ts
+coverage/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local
+*.local
+
+# Claude Flow local files
+.claude-flow/
