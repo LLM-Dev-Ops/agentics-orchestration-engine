@@ -14,12 +14,14 @@ import {
   FatalError,
   ErrorCodes,
 } from '../../error/types.js';
-import type {
-  IsolationBoundary,
-  NetworkEndpoint,
-  CredentialPattern,
-  FileSystemPath,
-  EnvironmentPattern,
+import {
+  createStrictIsolationBoundary,
+  createDevelopmentIsolationBoundary,
+  type IsolationBoundary,
+  type NetworkEndpoint,
+  type CredentialPattern,
+  type FileSystemPath,
+  type EnvironmentPattern,
 } from './boundary.js';
 
 // ============================================================================
@@ -598,8 +600,6 @@ export interface IsolationStatistics {
  * Creates an isolation enforcer with strict production boundary.
  */
 export function createStrictEnforcer(simulationId?: SimulationId): IsolationEnforcer {
-  // Import dynamically to avoid circular dependency
-  const { createStrictIsolationBoundary } = require('./boundary.js');
   const boundary = createStrictIsolationBoundary(`strict-${Date.now()}`);
   return new IsolationEnforcer(boundary, simulationId);
 }
@@ -609,8 +609,6 @@ export function createStrictEnforcer(simulationId?: SimulationId): IsolationEnfo
  * WARNING: Not for production use.
  */
 export function createDevelopmentEnforcer(simulationId?: SimulationId): IsolationEnforcer {
-  // Import dynamically to avoid circular dependency
-  const { createDevelopmentIsolationBoundary } = require('./boundary.js');
   const boundary = createDevelopmentIsolationBoundary(`dev-${Date.now()}`);
   return new IsolationEnforcer(boundary, simulationId);
 }

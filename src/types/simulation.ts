@@ -20,6 +20,7 @@ import type {
 } from './common.js';
 import type { ArtifactManifest } from './artifact.js';
 import type { ExecutionTrace } from './trace.js';
+import type { ExecutionProof } from './execution-proof.js';
 
 // ============================================================================
 // SIMULATION STATUS
@@ -345,6 +346,12 @@ export interface SimulationResult {
   readonly traceRef: TraceReference;
   /** Result metadata */
   readonly metadata: ResultMetadata;
+  /**
+   * Mandatory multi-layer execution proof.
+   * MUST contain at least: foundational, intelligence, core layers.
+   * Every successful response MUST include this proof.
+   */
+  readonly executionProof: ExecutionProof;
 }
 
 // ============================================================================

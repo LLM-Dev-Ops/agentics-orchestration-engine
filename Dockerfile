@@ -9,12 +9,15 @@ COPY package*.json ./
 # Install all dependencies (including dev for build)
 RUN npm ci
 
-# Copy source code
+# Copy source code and contracts
 COPY tsconfig.json ./
 COPY src/ ./src/
 
 # Build TypeScript
 RUN npm run build
+
+# Copy JSON schema files to dist (TypeScript doesn't copy non-ts files)
+RUN cp -r src/contracts/simulation dist/contracts/
 
 # Production stage - use slim image for smaller final image
 FROM node:20-slim AS production
@@ -33,8 +36,8 @@ COPY package*.json ./
 # Install production dependencies only
 RUN npm ci --omit=dev
 
-# Copy built files from builder
-COPY --from=builder /app/dist ./dist
+# Copy built files from builder with proper ownership
+COPY --from=builder --chown=node:node /app/dist ./dist
 
 # Set environment variables
 ENV NODE_ENV=production

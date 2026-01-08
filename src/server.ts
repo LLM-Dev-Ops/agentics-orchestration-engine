@@ -2,16 +2,21 @@
  * HTTP Server for Agentics Simulation Engine
  *
  * Exposes the simulation engine via REST API for Cloud Run deployment.
+ * Enforces contract validation at the earliest HTTP entry point.
  *
  * @module server
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { SimulationEngine, createSimulationEngine } from './core/engine.js';
+import { createSimulationEngine } from './core/engine.js';
 import type { SimulationConfig } from './types/simulation.js';
 import type { Scenario } from './types/scenario.js';
 import type { ISOTimestamp } from './types/common.js';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  validateSimulateRequest,
+  createContractViolationResponse,
+} from './contracts/index.js';
 
 // ============================================================================
 // TYPES
@@ -159,6 +164,10 @@ function handleHealth(res: ServerResponse): void {
 
 /**
  * Simulate endpoint - POST /v1/simulate
+ *
+ * CRITICAL: Contract validation occurs at the earliest entry point.
+ * Invalid requests MUST fail before any engine initialization,
+ * scenario loading, or execution begins.
  */
 async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // Validate method
@@ -167,17 +176,42 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     return;
   }
 
+  // Parse request body first
+  let rawBody: unknown;
   try {
-    // Parse request body
-    const body = await readJsonBody<SimulateRequest>(req);
-
-    // Validate scenario
-    if (!body.scenario) {
-      sendError(res, 400, 'INVALID_REQUEST', 'Missing required field: scenario');
-      return;
+    rawBody = await readJsonBody<unknown>(req);
+  } catch (error) {
+    if (error instanceof Error) {
+      if (error.message.includes('Invalid JSON')) {
+        sendError(res, 400, 'INVALID_JSON', error.message);
+      } else if (error.message.includes('Empty request body')) {
+        sendError(res, 400, 'EMPTY_BODY', 'Request body is required');
+      } else {
+        sendError(res, 400, 'PARSE_ERROR', error.message);
+      }
+    } else {
+      sendError(res, 400, 'PARSE_ERROR', 'Failed to parse request body');
     }
+    return;
+  }
 
-    // Create configuration
+  // CONTRACT VALIDATION - EARLIEST ENTRY POINT
+  // Validate against simulation/v1/request.schema.json with strict Ajv validation.
+  // No engine initialization, scenario loading, or execution may occur before this.
+  const validation = validateSimulateRequest(rawBody);
+  if (!validation.valid) {
+    // Contract violation - fail immediately with detailed errors
+    const errorResponse = createContractViolationResponse(validation.errors);
+    sendJson(res, 400, errorResponse);
+    return;
+  }
+
+  // Type assertion is now safe after schema validation
+  const body = rawBody as SimulateRequest;
+
+  try {
+    // Create configuration - no manual field checks needed
+    // Schema validation guarantees scenario exists and has required structure
     const config = body.config
       ? { ...createDefaultConfig(body.scenario), ...body.config }
       : createDefaultConfig(body.scenario);
@@ -189,7 +223,7 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     // Execute simulation
     const result = await engine.execute(body.scenario);
 
-    // Send result
+    // Send result with mandatory execution proof
     sendJson(res, 200, {
       success: true,
       result,
@@ -198,15 +232,9 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     console.error('Simulation error:', error);
 
     if (error instanceof Error) {
-      if (error.message.includes('Invalid JSON')) {
-        sendError(res, 400, 'INVALID_JSON', error.message);
-      } else if (error.message.includes('Empty request body')) {
-        sendError(res, 400, 'EMPTY_BODY', 'Request body is required');
-      } else {
-        sendError(res, 500, 'SIMULATION_ERROR', error.message, {
-          name: error.name,
-        });
-      }
+      sendError(res, 500, 'SIMULATION_ERROR', error.message, {
+        name: error.name,
+      });
     } else {
       sendError(res, 500, 'UNKNOWN_ERROR', 'An unknown error occurred');
     }
