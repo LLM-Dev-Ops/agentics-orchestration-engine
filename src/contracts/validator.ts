@@ -8,12 +8,28 @@
  * @module contracts/validator
  */
 
-import Ajv, { ErrorObject } from 'ajv';
+import Ajv, { ErrorObject, AnySchema } from 'ajv';
 import addFormats from 'ajv-formats';
-import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const require = createRequire(import.meta.url);
-const requestSchema = require('./simulation/v1/request.schema.json');
+// ESM-compatible JSON loading: resolve path relative to source file location
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Load the JSON schema - resolve path relative to project root
+function loadSchema(): AnySchema {
+  // In compiled code, we're in dist/contracts/, schema is in src/contracts/simulation/v1/
+  // Calculate path to schema relative to project root
+  const projectRoot = join(__dirname, '..', '..');
+  const schemaPath = join(projectRoot, 'src', 'contracts', 'simulation', 'v1', 'request.schema.json');
+
+  const content = readFileSync(schemaPath, 'utf-8');
+  return JSON.parse(content) as AnySchema;
+}
+
+const requestSchema = loadSchema();
 
 // ============================================================================
 // VALIDATION RESULT
