@@ -42,6 +42,215 @@ interface ErrorResponse {
 }
 
 // ============================================================================
+// REQUEST NORMALIZATION
+// ============================================================================
+
+/**
+ * Normalizes incoming request to match the strict schema format.
+ * Transforms simplified payloads from upstream services into compliant format.
+ */
+function normalizeRequest(input: unknown): unknown {
+  if (!input || typeof input !== 'object') {
+    return input;
+  }
+
+  const raw = input as Record<string, unknown>;
+
+  // Extract scenario from input (may be nested or at root)
+  let scenario = raw['scenario'] as Record<string, unknown> | undefined;
+
+  // If no scenario property, check if the input itself looks like a scenario
+  if (!scenario && raw['scenarioId']) {
+    scenario = raw as Record<string, unknown>;
+  }
+
+  if (!scenario) {
+    return input; // Let validation handle missing scenario
+  }
+
+  // Normalize version - convert string to object
+  let version = scenario['version'];
+  if (typeof version === 'string') {
+    const parts = version.split('.').map(Number);
+    version = {
+      major: parts[0] ?? 1,
+      minor: parts[1] ?? 0,
+      patch: parts[2] ?? 0,
+    };
+  } else if (!version || typeof version !== 'object') {
+    version = { major: 1, minor: 0, patch: 0 };
+  }
+
+  // Normalize category - default to 'custom' if invalid
+  const validCategories = ['deployment', 'policy', 'integration', 'failure', 'performance', 'compliance', 'migration', 'what-if', 'custom'];
+  let category = scenario['category'];
+  if (!category || !validCategories.includes(category as string)) {
+    category = 'custom';
+  }
+
+  // Normalize preconditions - ensure array of objects
+  let preconditions = scenario['preconditions'];
+  if (!Array.isArray(preconditions)) {
+    preconditions = [];
+  } else {
+    preconditions = preconditions.map((p, i) => {
+      if (typeof p === 'string') {
+        return { id: `precond-${i}`, description: p, expression: 'true' };
+      }
+      if (typeof p === 'object' && p !== null) {
+        const pc = p as Record<string, unknown>;
+        return {
+          id: pc['id'] ?? `precond-${i}`,
+          description: pc['description'] ?? String(pc['id'] ?? `Precondition ${i}`),
+          expression: pc['expression'] ?? 'true',
+          ...pc,
+        };
+      }
+      return { id: `precond-${i}`, description: String(p), expression: 'true' };
+    });
+  }
+
+  // Normalize setup - ensure array
+  let setup = scenario['setup'];
+  if (!Array.isArray(setup)) {
+    setup = [];
+  } else {
+    setup = setup.map((s, i) => {
+      if (typeof s === 'object' && s !== null) {
+        const st = s as Record<string, unknown>;
+        return {
+          id: st['id'] ?? `setup-${i}`,
+          name: st['name'] ?? `Setup ${i}`,
+          type: st['type'] ?? 'custom',
+          config: st['config'] ?? {},
+          required: st['required'] ?? true,
+          ...st,
+        };
+      }
+      return { id: `setup-${i}`, name: `Setup ${i}`, type: 'custom', config: {}, required: true };
+    });
+  }
+
+  // Normalize steps - ensure array with required fields
+  let steps = scenario['steps'];
+  if (!Array.isArray(steps)) {
+    // Create a minimal step if none provided
+    steps = [{
+      stepId: 'step-1',
+      name: 'Default Step',
+      order: { index: 0 },
+      type: 'custom',
+      config: {},
+    }];
+  } else {
+    steps = steps.map((s, i) => {
+      if (typeof s === 'object' && s !== null) {
+        const st = s as Record<string, unknown>;
+        // Build a clean step object with only valid properties
+        const normalizedStep: Record<string, unknown> = {
+          stepId: st['stepId'] ?? st['id'] ?? `step-${i}`,
+          name: st['name'] ?? `Step ${i}`,
+          order: st['order'] ?? { index: i },
+          type: st['type'] ?? 'custom',
+          config: st['config'] ?? {},
+        };
+        // Copy over optional valid properties
+        if (st['description']) normalizedStep['description'] = st['description'];
+        if (st['when']) normalizedStep['when'] = st['when'];
+        if (st['retry']) normalizedStep['retry'] = st['retry'];
+        if (st['timeoutMs']) normalizedStep['timeoutMs'] = st['timeoutMs'];
+        if (st['assertions']) normalizedStep['assertions'] = st['assertions'];
+        if (st['continueOnFailure'] !== undefined) normalizedStep['continueOnFailure'] = st['continueOnFailure'];
+        if (st['tags']) normalizedStep['tags'] = st['tags'];
+        if (st['metadata']) normalizedStep['metadata'] = st['metadata'];
+        return normalizedStep;
+      }
+      return { stepId: `step-${i}`, name: `Step ${i}`, order: { index: i }, type: 'custom', config: {} };
+    });
+  }
+
+  // Normalize teardown - ensure array
+  let teardown = scenario['teardown'];
+  if (!Array.isArray(teardown)) {
+    teardown = [];
+  } else {
+    teardown = teardown.map((t, i) => {
+      if (typeof t === 'object' && t !== null) {
+        const td = t as Record<string, unknown>;
+        return {
+          id: td['id'] ?? `teardown-${i}`,
+          name: td['name'] ?? `Teardown ${i}`,
+          type: td['type'] ?? 'cleanup',
+          config: td['config'] ?? {},
+          alwaysRun: td['alwaysRun'] ?? true,
+          ...td,
+        };
+      }
+      return { id: `teardown-${i}`, name: `Teardown ${i}`, type: 'cleanup', config: {}, alwaysRun: true };
+    });
+  }
+
+  // Normalize expectations - ensure array
+  let expectations = scenario['expectations'];
+  if (!Array.isArray(expectations)) {
+    expectations = [];
+  } else {
+    expectations = expectations.map((e, i) => {
+      if (typeof e === 'object' && e !== null) {
+        const ex = e as Record<string, unknown>;
+        return {
+          id: ex['id'] ?? `expect-${i}`,
+          description: ex['description'] ?? `Expectation ${i}`,
+          type: ex['type'] ?? 'custom',
+          expression: ex['expression'] ?? 'true',
+          severity: ex['severity'] ?? 'warning',
+          ...ex,
+        };
+      }
+      return { id: `expect-${i}`, description: String(e), type: 'custom', expression: 'true', severity: 'warning' };
+    });
+  }
+
+  // Build normalized scenario
+  const normalizedScenario: Record<string, unknown> = {
+    scenarioId: scenario['scenarioId'] ?? scenario['id'] ?? `scenario-${Date.now()}`,
+    version,
+    name: scenario['name'] ?? 'Unnamed Scenario',
+    description: scenario['description'] ?? '',
+    category,
+    tags: Array.isArray(scenario['tags']) ? scenario['tags'] : [],
+    preconditions,
+    setup,
+    steps,
+    teardown,
+    expectations,
+  };
+
+  // Copy optional fields if present
+  if (scenario['parameterDefinitions']) normalizedScenario['parameterDefinitions'] = scenario['parameterDefinitions'];
+  if (scenario['defaultParameters']) normalizedScenario['defaultParameters'] = scenario['defaultParameters'];
+  if (scenario['postconditions']) normalizedScenario['postconditions'] = scenario['postconditions'];
+  if (scenario['timeoutMs']) normalizedScenario['timeoutMs'] = scenario['timeoutMs'];
+  if (scenario['parallelizable'] !== undefined) normalizedScenario['parallelizable'] = scenario['parallelizable'];
+  if (scenario['dependencies']) normalizedScenario['dependencies'] = scenario['dependencies'];
+  if (scenario['author']) normalizedScenario['author'] = scenario['author'];
+  if (scenario['createdAt']) normalizedScenario['createdAt'] = scenario['createdAt'];
+  if (scenario['updatedAt']) normalizedScenario['updatedAt'] = scenario['updatedAt'];
+  if (scenario['contentHash']) normalizedScenario['contentHash'] = scenario['contentHash'];
+
+  // Return normalized request with only scenario and config (no extra properties)
+  const result: Record<string, unknown> = {
+    scenario: normalizedScenario,
+  };
+
+  if (raw['config']) {
+    result['config'] = raw['config'];
+  }
+
+  return result;
+}
+
+// ============================================================================
 // HELPERS
 // ============================================================================
 
@@ -196,12 +405,16 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
   }
 
   // DIAGNOSTIC LOGGING - Log full request body for debugging
-  console.log("SIMULATE BODY:", JSON.stringify(rawBody, null, 2));
+  console.log("SIMULATE BODY (raw):", JSON.stringify(rawBody, null, 2));
+
+  // NORMALIZE REQUEST - Transform simplified payloads to strict schema format
+  const normalizedBody = normalizeRequest(rawBody);
+  console.log("SIMULATE BODY (normalized):", JSON.stringify(normalizedBody, null, 2));
 
   // CONTRACT VALIDATION - EARLIEST ENTRY POINT
   // Validate against simulation/v1/request.schema.json with strict Ajv validation.
   // No engine initialization, scenario loading, or execution may occur before this.
-  const validation = validateSimulateRequest(rawBody);
+  const validation = validateSimulateRequest(normalizedBody);
   if (!validation.valid) {
     // Contract violation - fail immediately with detailed errors
     const errorResponse = createContractViolationResponse(validation.errors);
@@ -210,7 +423,7 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
   }
 
   // Type assertion is now safe after schema validation
-  const body = rawBody as SimulateRequest;
+  const body = normalizedBody as SimulateRequest;
 
   try {
     // Create configuration - no manual field checks needed
@@ -226,10 +439,22 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     // Execute simulation
     const result = await engine.execute(body.scenario);
 
-    // Send result with mandatory execution proof
+    // Send result with mandatory execution proof and execution_metadata
+    // execution_metadata is required by CLI contract for execution graph participation
     sendJson(res, 200, {
       success: true,
       result,
+      execution_metadata: {
+        service: 'agentics-simulation-engine',
+        version: '0.1.0',
+        timestamp: new Date().toISOString(),
+        simulation_id: result.simulationId,
+        status: result.status,
+        execution_proof: result.executionProof,
+        layers_executed: result.executionProof.layersExecuted,
+        proof_hash: result.executionProof.proofHash,
+        mandatory_layers_complete: result.executionProof.mandatoryLayersComplete,
+      },
     });
   } catch (error) {
     // DIAGNOSTIC LOGGING - Log full error details for debugging
