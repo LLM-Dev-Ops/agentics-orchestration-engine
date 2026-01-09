@@ -18,15 +18,28 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Load the JSON schema - resolve path relative to project root
+// Load the JSON schema - try multiple locations for different environments
 function loadSchema(): AnySchema {
-  // In compiled code, we're in dist/contracts/, schema is in src/contracts/simulation/v1/
-  // Calculate path to schema relative to project root
-  const projectRoot = join(__dirname, '..', '..');
-  const schemaPath = join(projectRoot, 'src', 'contracts', 'simulation', 'v1', 'request.schema.json');
+  const schemaRelativePath = join('simulation', 'v1', 'request.schema.json');
 
-  const content = readFileSync(schemaPath, 'utf-8');
-  return JSON.parse(content) as AnySchema;
+  // Possible schema locations:
+  // 1. Same directory as compiled code (Docker: dist/contracts/simulation/v1/)
+  // 2. Source directory (local dev: src/contracts/simulation/v1/)
+  const possiblePaths = [
+    join(__dirname, schemaRelativePath),  // Docker: /app/dist/contracts/simulation/v1/
+    join(__dirname, '..', '..', 'src', 'contracts', schemaRelativePath),  // Local dev
+  ];
+
+  for (const schemaPath of possiblePaths) {
+    try {
+      const content = readFileSync(schemaPath, 'utf-8');
+      return JSON.parse(content) as AnySchema;
+    } catch {
+      // Try next path
+    }
+  }
+
+  throw new Error(`Schema not found. Tried paths: ${possiblePaths.join(', ')}`);
 }
 
 const requestSchema = loadSchema();
