@@ -4,19 +4,52 @@
  * Exposes the simulation engine via REST API for Cloud Run deployment.
  * Enforces contract validation at the earliest HTTP entry point.
  *
+ * CRITICAL: All /v1/simulate responses MUST include execution_metadata.
+ * This is enforced through the centralized SimulateResponse helper.
+ *
  * @module server
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { createSimulationEngine } from './core/engine.js';
-import type { SimulationConfig } from './types/simulation.js';
+import type { SimulationConfig, SimulationResult } from './types/simulation.js';
 import type { Scenario } from './types/scenario.js';
 import type { ISOTimestamp } from './types/common.js';
 import { v4 as uuidv4 } from 'uuid';
 import {
   validateSimulateRequest,
-  createContractViolationResponse,
+  formatValidationErrors,
+  type ContractValidationError,
 } from './contracts/index.js';
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const SERVICE_NAME = 'agentics-simulation-engine';
+const SERVICE_VERSION = '0.1.0';
+// Unique service identifier for debugging which service responds to CLI
+const SERVICE_INSTANCE_ID = `engine-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+// ============================================================================
+// DIAGNOSTIC LOGGING
+// ============================================================================
+
+/**
+ * Logs response details for debugging CLI contract issues.
+ * CRITICAL: This helps identify which service/handler is responding.
+ */
+function logResponse(context: string, statusCode: number, hasExecutionMetadata: boolean, responsePreview?: string): void {
+  console.log(`[RESPONSE-DEBUG] ${new Date().toISOString()}`);
+  console.log(`  Service: ${SERVICE_NAME}`);
+  console.log(`  Instance: ${SERVICE_INSTANCE_ID}`);
+  console.log(`  Context: ${context}`);
+  console.log(`  Status: ${statusCode}`);
+  console.log(`  Has execution_metadata: ${hasExecutionMetadata}`);
+  if (responsePreview) {
+    console.log(`  Response preview: ${responsePreview.substring(0, 200)}...`);
+  }
+}
 
 // ============================================================================
 // TYPES
@@ -33,6 +66,10 @@ interface HealthResponse {
   timestamp: string;
 }
 
+/**
+ * Execution metadata - REQUIRED on ALL /v1/simulate responses.
+ * This is the contract enforcement point for CLI compatibility.
+ */
 interface ExecutionMetadata {
   service: string;
   version: string;
@@ -41,9 +78,18 @@ interface ExecutionMetadata {
   status: 'error' | 'success' | 'partial_success' | 'failure' | 'timeout' | 'cancelled';
   error_code?: string;
   error_phase?: string;
+  execution_proof?: unknown;
+  layers_executed?: readonly string[];
+  proof_hash?: unknown;
+  mandatory_layers_complete?: boolean;
+  // Debug field to identify which service instance is responding
+  _debug_service_instance?: string;
 }
 
-interface ErrorResponse {
+/**
+ * Error response structure with MANDATORY execution_metadata.
+ */
+interface SimulateErrorResponse {
   error: {
     code: string;
     message: string;
@@ -51,6 +97,20 @@ interface ErrorResponse {
   };
   execution_metadata: ExecutionMetadata;
 }
+
+/**
+ * Success response structure with MANDATORY execution_metadata.
+ */
+interface SimulateSuccessResponse {
+  success: true;
+  result: SimulationResult;
+  execution_metadata: ExecutionMetadata;
+}
+
+/**
+ * Union type for ALL simulate responses - guarantees execution_metadata.
+ */
+type SimulateResponse = SimulateErrorResponse | SimulateSuccessResponse;
 
 // ============================================================================
 // REQUEST NORMALIZATION
@@ -262,7 +322,7 @@ function normalizeRequest(input: unknown): unknown {
 }
 
 // ============================================================================
-// HELPERS
+// HELPERS - LOW LEVEL (Internal use only)
 // ============================================================================
 
 /**
@@ -294,9 +354,11 @@ async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
 }
 
 /**
- * Sends JSON response
+ * Low-level JSON response sender.
+ * INTERNAL USE ONLY - Do not use directly for /v1/simulate responses.
+ * Use sendSimulateResponse() instead to guarantee execution_metadata.
  */
-function sendJson(res: ServerResponse, statusCode: number, data: unknown): void {
+function _sendJsonInternal(res: ServerResponse, statusCode: number, data: unknown): void {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json',
     'X-Content-Type-Options': 'nosniff',
@@ -304,28 +366,93 @@ function sendJson(res: ServerResponse, statusCode: number, data: unknown): void 
   res.end(JSON.stringify(data));
 }
 
+// ============================================================================
+// CENTRALIZED SIMULATE RESPONSE HELPER
+// ============================================================================
+// CRITICAL: ALL /v1/simulate responses MUST go through this helper.
+// This is the SINGLE enforcement point for execution_metadata.
+// ============================================================================
+
 /**
  * Creates execution_metadata for error responses.
- * This ensures CLI contract compliance for all error paths.
+ * Guarantees all required fields are present.
+ * Includes debug instance ID to help trace which service responds.
  */
 function createErrorExecutionMetadata(code: string, phase: string): ExecutionMetadata {
   return {
-    service: 'agentics-simulation-engine',
-    version: '0.1.0',
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
     timestamp: new Date().toISOString(),
     simulation_id: null,
     status: 'error',
     error_code: code,
     error_phase: phase,
+    _debug_service_instance: SERVICE_INSTANCE_ID,
   };
 }
 
 /**
- * Sends error response with execution_metadata.
- * All error responses MUST include execution_metadata for CLI contract compliance.
+ * Creates execution_metadata for success responses.
+ * Extracts proof data from simulation result.
+ * Includes debug instance ID to help trace which service responds.
  */
-function sendError(res: ServerResponse, statusCode: number, code: string, message: string, details?: unknown, phase: string = 'request'): void {
-  const errorResponse: ErrorResponse = {
+function createSuccessExecutionMetadata(result: SimulationResult): ExecutionMetadata {
+  return {
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
+    timestamp: new Date().toISOString(),
+    simulation_id: result.simulationId,
+    status: result.status,
+    execution_proof: result.executionProof,
+    layers_executed: result.executionProof.layersExecuted,
+    proof_hash: result.executionProof.proofHash,
+    mandatory_layers_complete: result.executionProof.mandatoryLayersComplete,
+    _debug_service_instance: SERVICE_INSTANCE_ID,
+  };
+}
+
+/**
+ * CENTRALIZED SIMULATE RESPONSE SENDER
+ *
+ * This is the ONLY function that should be used to send responses for /v1/simulate.
+ * It GUARANTEES that execution_metadata is present on every response.
+ *
+ * The type system enforces that the response must be a SimulateResponse,
+ * which requires execution_metadata to be present.
+ */
+function sendSimulateResponse(res: ServerResponse, statusCode: number, response: SimulateResponse): void {
+  // Runtime validation - belt and suspenders
+  if (!response.execution_metadata) {
+    console.error('CRITICAL: Attempted to send simulate response without execution_metadata');
+    // Inject emergency execution_metadata to prevent contract violation
+    (response as SimulateErrorResponse).execution_metadata = createErrorExecutionMetadata(
+      'INTERNAL_METADATA_ERROR',
+      'response'
+    );
+  }
+
+  // DIAGNOSTIC LOGGING - helps identify if this service is the responder
+  const responseStr = JSON.stringify(response);
+  const hasMetadata = !!response.execution_metadata;
+  const context = 'error' in response ? `error:${response.error.code}` : 'success';
+  logResponse(`sendSimulateResponse:${context}`, statusCode, hasMetadata, responseStr);
+
+  _sendJsonInternal(res, statusCode, response);
+}
+
+/**
+ * Sends a simulate error response with guaranteed execution_metadata.
+ * This is the PRIMARY error response function for /v1/simulate.
+ */
+function sendSimulateError(
+  res: ServerResponse,
+  statusCode: number,
+  code: string,
+  message: string,
+  phase: string,
+  details?: unknown
+): void {
+  const response: SimulateErrorResponse = {
     error: {
       code,
       message,
@@ -333,7 +460,42 @@ function sendError(res: ServerResponse, statusCode: number, code: string, messag
     },
     execution_metadata: createErrorExecutionMetadata(code, phase),
   };
-  sendJson(res, statusCode, errorResponse);
+  sendSimulateResponse(res, statusCode, response);
+}
+
+/**
+ * Sends a simulate success response with guaranteed execution_metadata.
+ * This is the PRIMARY success response function for /v1/simulate.
+ */
+function sendSimulateSuccess(res: ServerResponse, result: SimulationResult): void {
+  const response: SimulateSuccessResponse = {
+    success: true,
+    result,
+    execution_metadata: createSuccessExecutionMetadata(result),
+  };
+  sendSimulateResponse(res, 200, response);
+}
+
+/**
+ * Sends a contract violation error response with guaranteed execution_metadata.
+ * Used when request validation fails.
+ */
+function sendContractViolation(
+  res: ServerResponse,
+  errors: ReadonlyArray<ContractValidationError>
+): void {
+  const response: SimulateErrorResponse = {
+    error: {
+      code: 'CONTRACT_VIOLATION',
+      message: `Request does not conform to simulation/v1/request.schema.json: ${formatValidationErrors(errors)}`,
+      details: {
+        violations: errors,
+        schema: 'simulation/v1/request.schema.json',
+      },
+    },
+    execution_metadata: createErrorExecutionMetadata('CONTRACT_VIOLATION', 'validation'),
+  };
+  sendSimulateResponse(res, 400, response);
 }
 
 /**
@@ -389,15 +551,16 @@ function createDefaultConfig(scenario: Scenario): SimulationConfig {
 // ============================================================================
 
 /**
- * Health check endpoint
+ * Health check endpoint - does NOT require execution_metadata
+ * (only /v1/simulate requires it)
  */
 function handleHealth(res: ServerResponse): void {
   const health: HealthResponse = {
     status: 'healthy',
-    version: '0.1.0',
+    version: SERVICE_VERSION,
     timestamp: new Date().toISOString(),
   };
-  sendJson(res, 200, health);
+  _sendJsonInternal(res, 200, health);
 }
 
 /**
@@ -406,11 +569,14 @@ function handleHealth(res: ServerResponse): void {
  * CRITICAL: Contract validation occurs at the earliest entry point.
  * Invalid requests MUST fail before any engine initialization,
  * scenario loading, or execution begins.
+ *
+ * ALL responses from this handler use the centralized sendSimulate* functions
+ * to GUARANTEE execution_metadata is present.
  */
 async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  // Validate method
+  // Validate method - use centralized error handler
   if (req.method !== 'POST') {
-    sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Only POST method is allowed', undefined, 'request');
+    sendSimulateError(res, 405, 'METHOD_NOT_ALLOWED', 'Only POST method is allowed', 'request');
     return;
   }
 
@@ -421,14 +587,14 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
   } catch (error) {
     if (error instanceof Error) {
       if (error.message.includes('Invalid JSON')) {
-        sendError(res, 400, 'INVALID_JSON', error.message, undefined, 'parsing');
+        sendSimulateError(res, 400, 'INVALID_JSON', error.message, 'parsing');
       } else if (error.message.includes('Empty request body')) {
-        sendError(res, 400, 'EMPTY_BODY', 'Request body is required', undefined, 'parsing');
+        sendSimulateError(res, 400, 'EMPTY_BODY', 'Request body is required', 'parsing');
       } else {
-        sendError(res, 400, 'PARSE_ERROR', error.message, undefined, 'parsing');
+        sendSimulateError(res, 400, 'PARSE_ERROR', error.message, 'parsing');
       }
     } else {
-      sendError(res, 400, 'PARSE_ERROR', 'Failed to parse request body', undefined, 'parsing');
+      sendSimulateError(res, 400, 'PARSE_ERROR', 'Failed to parse request body', 'parsing');
     }
     return;
   }
@@ -445,9 +611,8 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
   // No engine initialization, scenario loading, or execution may occur before this.
   const validation = validateSimulateRequest(normalizedBody);
   if (!validation.valid) {
-    // Contract violation - fail immediately with detailed errors
-    const errorResponse = createContractViolationResponse(validation.errors);
-    sendJson(res, 400, errorResponse);
+    // Contract violation - use centralized handler with guaranteed execution_metadata
+    sendContractViolation(res, validation.errors);
     return;
   }
 
@@ -468,45 +633,30 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     // Execute simulation
     const result = await engine.execute(body.scenario);
 
-    // Send result with mandatory execution proof and execution_metadata
-    // execution_metadata is required by CLI contract for execution graph participation
-    sendJson(res, 200, {
-      success: true,
-      result,
-      execution_metadata: {
-        service: 'agentics-simulation-engine',
-        version: '0.1.0',
-        timestamp: new Date().toISOString(),
-        simulation_id: result.simulationId,
-        status: result.status,
-        execution_proof: result.executionProof,
-        layers_executed: result.executionProof.layersExecuted,
-        proof_hash: result.executionProof.proofHash,
-        mandatory_layers_complete: result.executionProof.mandatoryLayersComplete,
-      },
-    });
+    // Send success response with guaranteed execution_metadata
+    sendSimulateSuccess(res, result);
   } catch (error) {
     // DIAGNOSTIC LOGGING - Log full error details for debugging
-    // Use JSON.stringify to properly serialize non-Error objects
     console.error("SIMULATION ERROR:", error);
     console.error("SIMULATION ERROR (stringified):", JSON.stringify(error, Object.getOwnPropertyNames(error ?? {}), 2));
     if (error instanceof Error && error.stack) {
       console.error("SIMULATION ERROR STACK:", error.stack);
     }
 
+    // Use centralized error handler with guaranteed execution_metadata
     if (error instanceof Error) {
-      sendError(res, 500, 'SIMULATION_ERROR', error.message, {
+      sendSimulateError(res, 500, 'SIMULATION_ERROR', error.message, 'execution', {
         name: error.name,
         stack: error.stack,
-      }, 'execution');
+      });
     } else {
       // Handle non-Error thrown values (objects, strings, etc.)
       const errorStr = typeof error === 'string'
         ? error
         : JSON.stringify(error, null, 2);
-      sendError(res, 500, 'UNKNOWN_ERROR', `Non-Error thrown: ${errorStr}`, {
+      sendSimulateError(res, 500, 'UNKNOWN_ERROR', `Non-Error thrown: ${errorStr}`, 'execution', {
         rawError: error,
-      }, 'execution');
+      });
     }
   }
 }
@@ -516,7 +666,28 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 // ============================================================================
 
 /**
+ * Sends a generic error response for non-simulate endpoints.
+ * These endpoints do NOT require execution_metadata.
+ */
+function sendGenericError(res: ServerResponse, statusCode: number, code: string, message: string): void {
+  _sendJsonInternal(res, statusCode, {
+    error: { code, message },
+  });
+}
+
+/**
+ * Checks if a path is related to the simulate endpoint.
+ * Used to determine whether to include execution_metadata in error responses.
+ */
+function isSimulatePath(path: string): boolean {
+  return path.startsWith('/v1/simulate') || path === '/simulate';
+}
+
+/**
  * Main request handler
+ *
+ * CRITICAL: All errors for simulate-related paths MUST include execution_metadata.
+ * This router ensures proper error handling based on the requested path.
  */
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -529,7 +700,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  // Handle preflight
+  // Handle preflight - CORS preflight does not need execution_metadata
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
@@ -550,11 +721,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         break;
 
       default:
-        sendError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`, undefined, 'routing');
+        // For simulate-related paths, include execution_metadata in 404
+        if (isSimulatePath(path)) {
+          sendSimulateError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`, 'routing');
+        } else {
+          sendGenericError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`);
+        }
     }
   } catch (error) {
     console.error('Unhandled error:', error);
-    sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', undefined, 'routing');
+    // For simulate-related paths, include execution_metadata in error
+    if (isSimulatePath(path)) {
+      sendSimulateError(res, 500, 'INTERNAL_ERROR', 'Internal server error', 'routing');
+    } else {
+      sendGenericError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
+    }
   }
 }
 
@@ -568,7 +749,9 @@ const server = createServer((req, res) => {
   handleRequest(req, res).catch((error) => {
     console.error('Request handler error:', error);
     if (!res.headersSent) {
-      sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', undefined, 'routing');
+      // Use simulate error for any unhandled errors to be safe
+      // This ensures CLI contract compliance even for edge cases
+      sendSimulateError(res, 500, 'INTERNAL_ERROR', 'Internal server error', 'routing');
     }
   });
 });
