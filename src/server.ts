@@ -33,12 +33,23 @@ interface HealthResponse {
   timestamp: string;
 }
 
+interface ExecutionMetadata {
+  service: string;
+  version: string;
+  timestamp: string;
+  simulation_id: string | null;
+  status: 'error' | 'success' | 'partial_success' | 'failure' | 'timeout' | 'cancelled';
+  error_code?: string;
+  error_phase?: string;
+}
+
 interface ErrorResponse {
   error: {
     code: string;
     message: string;
     details?: unknown;
   };
+  execution_metadata: ExecutionMetadata;
 }
 
 // ============================================================================
@@ -294,15 +305,33 @@ function sendJson(res: ServerResponse, statusCode: number, data: unknown): void 
 }
 
 /**
- * Sends error response
+ * Creates execution_metadata for error responses.
+ * This ensures CLI contract compliance for all error paths.
  */
-function sendError(res: ServerResponse, statusCode: number, code: string, message: string, details?: unknown): void {
+function createErrorExecutionMetadata(code: string, phase: string): ExecutionMetadata {
+  return {
+    service: 'agentics-simulation-engine',
+    version: '0.1.0',
+    timestamp: new Date().toISOString(),
+    simulation_id: null,
+    status: 'error',
+    error_code: code,
+    error_phase: phase,
+  };
+}
+
+/**
+ * Sends error response with execution_metadata.
+ * All error responses MUST include execution_metadata for CLI contract compliance.
+ */
+function sendError(res: ServerResponse, statusCode: number, code: string, message: string, details?: unknown, phase: string = 'request'): void {
   const errorResponse: ErrorResponse = {
     error: {
       code,
       message,
       ...(details !== undefined && { details }),
     },
+    execution_metadata: createErrorExecutionMetadata(code, phase),
   };
   sendJson(res, statusCode, errorResponse);
 }
@@ -381,7 +410,7 @@ function handleHealth(res: ServerResponse): void {
 async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // Validate method
   if (req.method !== 'POST') {
-    sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Only POST method is allowed');
+    sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Only POST method is allowed', undefined, 'request');
     return;
   }
 
@@ -392,14 +421,14 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
   } catch (error) {
     if (error instanceof Error) {
       if (error.message.includes('Invalid JSON')) {
-        sendError(res, 400, 'INVALID_JSON', error.message);
+        sendError(res, 400, 'INVALID_JSON', error.message, undefined, 'parsing');
       } else if (error.message.includes('Empty request body')) {
-        sendError(res, 400, 'EMPTY_BODY', 'Request body is required');
+        sendError(res, 400, 'EMPTY_BODY', 'Request body is required', undefined, 'parsing');
       } else {
-        sendError(res, 400, 'PARSE_ERROR', error.message);
+        sendError(res, 400, 'PARSE_ERROR', error.message, undefined, 'parsing');
       }
     } else {
-      sendError(res, 400, 'PARSE_ERROR', 'Failed to parse request body');
+      sendError(res, 400, 'PARSE_ERROR', 'Failed to parse request body', undefined, 'parsing');
     }
     return;
   }
@@ -469,7 +498,7 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
       sendError(res, 500, 'SIMULATION_ERROR', error.message, {
         name: error.name,
         stack: error.stack,
-      });
+      }, 'execution');
     } else {
       // Handle non-Error thrown values (objects, strings, etc.)
       const errorStr = typeof error === 'string'
@@ -477,7 +506,7 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
         : JSON.stringify(error, null, 2);
       sendError(res, 500, 'UNKNOWN_ERROR', `Non-Error thrown: ${errorStr}`, {
         rawError: error,
-      });
+      }, 'execution');
     }
   }
 }
@@ -521,11 +550,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         break;
 
       default:
-        sendError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`);
+        sendError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`, undefined, 'routing');
     }
   } catch (error) {
     console.error('Unhandled error:', error);
-    sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', undefined, 'routing');
   }
 }
 
@@ -539,7 +568,7 @@ const server = createServer((req, res) => {
   handleRequest(req, res).catch((error) => {
     console.error('Request handler error:', error);
     if (!res.headersSent) {
-      sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error');
+      sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', undefined, 'routing');
     }
   });
 });

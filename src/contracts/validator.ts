@@ -136,9 +136,10 @@ export function formatValidationErrors(errors: ReadonlyArray<ContractValidationE
 
 /**
  * Creates a structured error response for contract violations.
+ * Includes execution_metadata for CLI contract compliance.
  *
  * @param errors - Array of validation errors
- * @returns Error response object
+ * @returns Error response object with execution_metadata
  */
 export function createContractViolationResponse(errors: ReadonlyArray<ContractValidationError>): {
   error: {
@@ -149,6 +150,15 @@ export function createContractViolationResponse(errors: ReadonlyArray<ContractVa
       schema: string;
     };
   };
+  execution_metadata: {
+    service: string;
+    version: string;
+    timestamp: string;
+    simulation_id: null;
+    status: 'error';
+    error_code: string;
+    error_phase: string;
+  };
 } {
   return {
     error: {
@@ -158,6 +168,15 @@ export function createContractViolationResponse(errors: ReadonlyArray<ContractVa
         violations: errors,
         schema: 'simulation/v1/request.schema.json',
       },
+    },
+    execution_metadata: {
+      service: 'agentics-simulation-engine',
+      version: '0.1.0',
+      timestamp: new Date().toISOString(),
+      simulation_id: null,
+      status: 'error',
+      error_code: 'CONTRACT_VIOLATION',
+      error_phase: 'validation',
     },
   };
 }
