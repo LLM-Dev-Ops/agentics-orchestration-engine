@@ -195,6 +195,9 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     return;
   }
 
+  // DIAGNOSTIC LOGGING - Log full request body for debugging
+  console.log("SIMULATE BODY:", JSON.stringify(rawBody, null, 2));
+
   // CONTRACT VALIDATION - EARLIEST ENTRY POINT
   // Validate against simulation/v1/request.schema.json with strict Ajv validation.
   // No engine initialization, scenario loading, or execution may occur before this.
@@ -229,14 +232,27 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
       result,
     });
   } catch (error) {
-    console.error('Simulation error:', error);
+    // DIAGNOSTIC LOGGING - Log full error details for debugging
+    // Use JSON.stringify to properly serialize non-Error objects
+    console.error("SIMULATION ERROR:", error);
+    console.error("SIMULATION ERROR (stringified):", JSON.stringify(error, Object.getOwnPropertyNames(error ?? {}), 2));
+    if (error instanceof Error && error.stack) {
+      console.error("SIMULATION ERROR STACK:", error.stack);
+    }
 
     if (error instanceof Error) {
       sendError(res, 500, 'SIMULATION_ERROR', error.message, {
         name: error.name,
+        stack: error.stack,
       });
     } else {
-      sendError(res, 500, 'UNKNOWN_ERROR', 'An unknown error occurred');
+      // Handle non-Error thrown values (objects, strings, etc.)
+      const errorStr = typeof error === 'string'
+        ? error
+        : JSON.stringify(error, null, 2);
+      sendError(res, 500, 'UNKNOWN_ERROR', `Non-Error thrown: ${errorStr}`, {
+        rawError: error,
+      });
     }
   }
 }
