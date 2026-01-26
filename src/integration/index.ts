@@ -6,3 +6,7 @@
 
 export * from './adapters/index.js';
 export * from './api/index.js';
+
+// Re-export ruvector module for convenience
+// Note: ruvector is also available as a top-level module
+export * as ruvector from '../ruvector/index.js';

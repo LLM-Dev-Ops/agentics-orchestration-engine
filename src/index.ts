@@ -26,6 +26,9 @@ export * from './core/index.js';
 // Re-export integration interfaces
 export * from './integration/index.js';
 
+// Re-export Ruvector event-driven execution bridge
+export * from './ruvector/index.js';
+
 // Re-export trace collection (with renamed exports to avoid conflicts)
 export {
   TraceSpan as RuntimeTraceSpan,
