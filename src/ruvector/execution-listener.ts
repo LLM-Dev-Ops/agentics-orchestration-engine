@@ -258,25 +258,65 @@ export class ExecutionListener {
   private async handleDecisionEvent(event: DecisionEvent): Promise<void> {
     this.status = { ...this.status, eventsReceived: this.status.eventsReceived + 1 };
 
+    // Extract payload from event - Ruvector sends data in payload wrapper
+    const { type, payload } = event as DecisionEvent & {
+      payload?: {
+        plan_id?: PlanId;
+        simulation_id?: SimulationId;
+        advisory?: boolean;
+        execution_profile?: ExecutionProfile;
+      };
+    };
+    const { plan_id, simulation_id, advisory, execution_profile } = payload ?? {};
+
     console.log('[ExecutionListener] Received decision event', {
-      type: event.type,
-      plan_id: event.plan_id,
-      simulation_id: event.simulation_id,
+      type,
+      plan_id,
+      simulation_id,
+      advisory,
     });
 
     // Filter: Only process plan_approved events
-    if (!isPlanApprovedEvent(event)) {
-      console.log(`[ExecutionListener] Ignoring event type: ${event.type}`);
+    if (type !== 'plan_approved') {
+      console.log(`[ExecutionListener] Ignoring event type: ${type}`);
       return;
     }
 
+    // Defensive guard: Check for required fields in payload
+    if (!plan_id || !simulation_id) {
+      console.warn('[ExecutionListener] Missing required fields in payload', {
+        has_plan_id: !!plan_id,
+        has_simulation_id: !!simulation_id,
+        payload,
+      });
+      return;
+    }
+
+    // Ignore advisory approvals - only execute real approvals
+    if (advisory === true) {
+      console.log('[ExecutionListener] Ignoring advisory approval', {
+        plan_id,
+        simulation_id,
+      });
+      return;
+    }
+
+    // Construct normalized event with payload fields at top level for downstream processing
+    const normalizedEvent: PlanApprovedEvent = {
+      ...event,
+      type: 'plan_approved',
+      plan_id,
+      simulation_id,
+      execution_profile: execution_profile ?? { tier: 'tier1', mode: 'execute' },
+    } as PlanApprovedEvent;
+
     // Validate: Ensure event has all required fields
-    if (!this.validateEvent(event)) {
+    if (!this.validateEvent(normalizedEvent)) {
       console.log('[ExecutionListener] Event validation failed, skipping');
       this.emitExecutionEvent({
         type: 'skipped',
-        planId: event.plan_id,
-        simulationId: event.simulation_id!,
+        planId: plan_id,
+        simulationId: simulation_id,
         timestamp: new Date().toISOString() as ISOTimestamp,
         reason: 'Event validation failed: missing required fields',
       });
@@ -285,13 +325,13 @@ export class ExecutionListener {
     }
 
     // Idempotency check: Prevent duplicate execution
-    const idempotencyCheck = this.idempotencyGuard.check(event.plan_id);
+    const idempotencyCheck = this.idempotencyGuard.check(plan_id);
     if (!idempotencyCheck.shouldExecute) {
       console.log('[ExecutionListener] Idempotency check failed:', idempotencyCheck.reason);
       this.emitExecutionEvent({
         type: 'skipped',
-        planId: event.plan_id,
-        simulationId: event.simulation_id,
+        planId: plan_id,
+        simulationId: simulation_id,
         timestamp: new Date().toISOString() as ISOTimestamp,
         reason: idempotencyCheck.reason,
       });
@@ -309,12 +349,12 @@ export class ExecutionListener {
     // Execute simulation
     if (this.config.asyncExecution) {
       // Fire and forget - don't block on execution
-      this.executeSimulation(event).catch((error) => {
+      this.executeSimulation(normalizedEvent).catch((error) => {
         console.error('[ExecutionListener] Async execution error:', error);
       });
     } else {
       // Synchronous execution
-      await this.executeSimulation(event);
+      await this.executeSimulation(normalizedEvent);
     }
   }
 
