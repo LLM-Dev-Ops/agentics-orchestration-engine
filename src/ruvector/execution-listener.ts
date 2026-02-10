@@ -14,6 +14,8 @@ import type { SimulationId, ISOTimestamp } from '../types/common.js';
 import type { SimulationConfig, SimulationResult } from '../types/simulation.js';
 import type { Scenario } from '../types/scenario.js';
 import { SimulationEngine, createSimulationEngine } from '../core/engine.js';
+import type { CoreClientRegistry } from '../integration/cores/core-client.js';
+import { createMockCoreClientRegistry } from '../integration/cores/mock-cores.js';
 import {
   RuvectorClient,
   createRuvectorClient,
@@ -139,6 +141,7 @@ export class ExecutionListener {
   private readonly ruvectorClient: RuvectorClient;
   private readonly idempotencyGuard: IdempotencyGuard;
   private readonly simulationResolver: SimulationResolver;
+  private readonly coreClients: CoreClientRegistry;
   private readonly eventListeners: Set<ExecutionEventListener> = new Set();
 
   private status: ExecutionListenerStatus = {
@@ -156,10 +159,12 @@ export class ExecutionListener {
   constructor(
     config: ExecutionListenerConfig,
     simulationResolver: SimulationResolver,
-    secretManager?: SecretManager
+    secretManager?: SecretManager,
+    coreClients?: CoreClientRegistry
   ) {
     this.config = config;
     this.simulationResolver = simulationResolver;
+    this.coreClients = coreClients ?? createMockCoreClientRegistry();
     this.ruvectorClient = createRuvectorClient(config.ruvector, secretManager);
     this.idempotencyGuard = createIdempotencyGuard(config.idempotency);
   }
@@ -427,9 +432,9 @@ export class ExecutionListener {
       const config = await this.simulationResolver.resolveConfig(simulation_id);
       const scenario = await this.simulationResolver.resolveScenario(simulation_id);
 
-      // Create and initialize the simulation engine
+      // Create and initialize the simulation engine with Core clients
       const engine = createSimulationEngine();
-      await engine.initialize(config);
+      await engine.initialize(config, this.coreClients);
 
       // Execute the simulation
       // This is the SAME PATH used for real execution

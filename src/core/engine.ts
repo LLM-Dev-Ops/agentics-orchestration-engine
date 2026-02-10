@@ -2,8 +2,17 @@
  * Simulation Engine.
  *
  * The main orchestrator for simulation execution.
- * Coordinates all subsystems: lifecycle, resources, policies,
- * scenarios, state management, and artifact generation.
+ * Coordinates all subsystems and delegates execution responsibilities
+ * to external Agentics Cores:
+ *
+ * - LLM-Security-Core: Policy evaluation
+ * - LLM-Data-Core: Cost attribution
+ * - LLM-Automation-Core: Artifact generation
+ * - LLM-Governance-Core: Governance validation
+ *
+ * The engine retains scenario decomposition, coordination, and tracing.
+ * Each Core delegation creates a child span, propagates parent_span_id,
+ * and rejects flat (non-hierarchical) results.
  *
  * @module core/engine
  */
@@ -35,6 +44,18 @@ import type {
   LayerOperation,
 } from '../types/execution-proof.js';
 import { MANDATORY_LAYERS } from '../types/execution-proof.js';
+import type {
+  CoreRequest,
+  CoreResponse,
+  SecurityCoreRequest,
+  SecurityCoreResponse,
+  DataCoreRequest,
+  DataCoreResponse,
+  AutomationCoreRequest,
+  AutomationCoreResponse,
+  GovernanceCoreRequest,
+  GovernanceCoreResponse,
+} from '../types/core-delegation.js';
 import {
   ExecutionContext,
   createExecutionContext,
@@ -47,9 +68,13 @@ import {
   type StateProvider,
 } from '../scenario/manager.js';
 import {
-  PolicyEngine,
-  createPolicyEngine,
-} from '../policy/engine.js';
+  TraceSpan,
+  createRootSpan,
+  extractSpanContext,
+} from '../trace/span.js';
+import type { CoreClient, CoreClientRegistry } from '../integration/cores/core-client.js';
+import { validateCoreSpanHierarchy } from '../integration/cores/span-validator.js';
+import { CoreDelegationError } from '../integration/cores/errors.js';
 import { createContentHashFromObject } from '../utils/hash.js';
 import { canonicalSerialize } from '../utils/serialize.js';
 
@@ -87,22 +112,29 @@ interface EngineState {
  * - Configuration validation
  * - Lifecycle management
  * - Resource enforcement
- * - Policy evaluation
- * - Scenario execution
- * - State management
- * - Artifact generation
+ * - Scenario decomposition and coordination
+ * - Core delegation with span propagation
+ * - Execution proof generation
  *
- * Execution phases:
- * 1. PLANNING - Validate config, load scenario
- * 2. EXECUTION - Run steps, apply policies
- * 3. ANALYSIS - Aggregate results, compute metrics
- * 4. EXPORT - Generate artifacts
+ * Delegated responsibilities (via external Agentics Cores):
+ * - Policy evaluation → LLM-Security-Core
+ * - Cost attribution → LLM-Data-Core
+ * - Artifact generation → LLM-Automation-Core
+ * - Governance validation → LLM-Governance-Core
+ *
+ * Execution layers:
+ * 1. FOUNDATIONAL - Base infrastructure setup
+ * 2. INTELLIGENCE - Scenario validation + policy analysis (Security Core)
+ * 3. CORE - Step execution & state transitions (internal)
+ * 4. VALIDATION - Policy aggregation (Security), cost (Data), governance (Governance)
+ * 5. ARTIFACT - Artifact generation (Automation Core)
  */
 export class SimulationEngine {
   private config?: SimulationConfig;
   private context?: ExecutionContext;
   private scenarioManager?: ScenarioManager;
-  private policyEngine?: PolicyEngine;
+  private coreClients?: CoreClientRegistry;
+  private rootSpan?: TraceSpan;
   private state: EngineState = {
     status: 'queued',
     phase: 'initializing',
@@ -118,13 +150,17 @@ export class SimulationEngine {
   // ==========================================================================
 
   /**
-   * Initializes the simulation engine with configuration.
+   * Initializes the simulation engine with configuration and Core clients.
    *
    * @param config - Simulation configuration
+   * @param coreClients - Registry of external Agentics Core clients
    * @returns Execution context for the simulation
    * @throws ConfigurationError if config is invalid
    */
-  async initialize(config: SimulationConfig): Promise<ExecutionContext> {
+  async initialize(
+    config: SimulationConfig,
+    coreClients: CoreClientRegistry
+  ): Promise<ExecutionContext> {
     this.state.status = 'initializing';
     this.state.phase = 'initializing';
 
@@ -139,6 +175,7 @@ export class SimulationEngine {
     }
 
     this.config = config;
+    this.coreClients = coreClients;
 
     // Create execution context
     const contextConfig: ExecutionContextConfig = {
@@ -148,7 +185,7 @@ export class SimulationEngine {
     };
     this.context = createExecutionContext(contextConfig);
 
-    // Initialize subsystems
+    // Initialize subsystems (scenario coordination stays internal)
     this.scenarioManager = createScenarioManager({
       simulationId: config.simulationId,
       defaultStepTimeout: 30000,
@@ -156,20 +193,15 @@ export class SimulationEngine {
       getTime: () => this.context!.getTime(),
     });
 
-    this.policyEngine = createPolicyEngine({
-      simulationId: config.simulationId,
-      getTime: () => this.context!.getTime(),
-    });
-
-    // Load policies
-    for (const policyRef of config.policies) {
-      // In a real implementation, this would load from registry
-      // For now, policies would be loaded via the policy engine's load methods
-    }
-
     this.state.phase = 'configuring';
     this.context.recordLifecycleEvent('engine_initialized', {
       configHash: createContentHashFromObject(config),
+      coresRegistered: [
+        coreClients.security.coreName,
+        coreClients.data.coreName,
+        coreClients.automation.coreName,
+        coreClients.governance.coreName,
+      ],
     });
 
     return this.context;
@@ -189,11 +221,16 @@ export class SimulationEngine {
   /**
    * Executes the simulation with the given scenario.
    *
+   * Delegates policy evaluation, cost attribution, artifact generation,
+   * and governance validation to external Agentics Cores. Each delegation
+   * creates a child Core span, propagates parent_span_id, and requires
+   * nested repo + agent spans. Flat results are rejected.
+   *
    * @param scenario - Scenario to execute
    * @returns Complete simulation result with mandatory execution proof
    */
   async execute(scenario: Scenario): Promise<SimulationResult> {
-    if (!this.context || !this.config || !this.scenarioManager) {
+    if (!this.context || !this.config || !this.scenarioManager || !this.coreClients) {
       throw new SimulationEngineError(
         'Engine not initialized',
         'NOT_INITIALIZED',
@@ -206,6 +243,15 @@ export class SimulationEngine {
     this.state.phase = 'validating';
     this.state.startTime = new Date();
     this.state.layerRecords = [];
+
+    // Create root span for the entire simulation execution
+    this.rootSpan = createRootSpan('simulation.execute', 'simulation-engine', {
+      getTime: () => this.context!.getTime(),
+      attributes: {
+        'simulation.id': this.config.simulationId,
+        'scenario.id': this.config.scenario.scenarioId,
+      },
+    });
 
     try {
       // ========================================================================
@@ -224,12 +270,13 @@ export class SimulationEngine {
 
       // ========================================================================
       // INTELLIGENCE LAYER - Smart processing & analysis
+      // Delegates: Policy analysis → LLM-Security-Core
       // ========================================================================
       this.startLayer('intelligence');
       this.context.recordLifecycleEvent('layer_started', { layer: 'intelligence' });
       this.context.recordLifecycleEvent('phase_started', { phase: 'planning' });
 
-      // Validate scenario
+      // Validate scenario (internal - ScenarioManager retained)
       const scenarioValidation = this.scenarioManager.validateScenario(scenario);
       if (!scenarioValidation.valid) {
         this.endLayer('intelligence', false, {
@@ -244,18 +291,36 @@ export class SimulationEngine {
       }
       this.recordLayerOperation('scenario_validated', true);
 
-      // Prepare scenario with parameter resolution
+      // Prepare scenario with parameter resolution (internal)
       const prepared = this.scenarioManager.prepareScenario(
         scenario,
         this.config.scenario.parameters ?? {}
       );
       this.recordLayerOperation('scenario_prepared', true);
-      this.recordLayerOperation('policy_analysis', true);
+
+      // DELEGATE: Pre-execution policy analysis to LLM-Security-Core
+      const securityPreResult = await this.delegateToCore<
+        SecurityCoreRequest,
+        SecurityCoreResponse
+      >(this.coreClients.security, 'intelligence.policy_analysis', {
+        coreType: 'llm-security-core',
+        phase: 'pre-execution',
+        policyReferences: this.config.policies.map((p) => ({
+          policyId: p.policyId as string,
+          version: p.version,
+        })),
+        evaluationContext: {
+          scenarioId: this.config.scenario.scenarioId,
+          parameters: this.config.scenario.parameters ?? {},
+        },
+        stateSnapshot: this.stateData,
+      });
+      this.recordLayerOperation('policy_analysis_delegated', securityPreResult.success);
 
       this.endLayer('intelligence', true);
 
       // ========================================================================
-      // CORE LAYER - Step execution & state transitions
+      // CORE LAYER - Step execution & state transitions (internal)
       // ========================================================================
       this.startLayer('core');
       this.context.recordLifecycleEvent('layer_started', { layer: 'core' });
@@ -266,7 +331,7 @@ export class SimulationEngine {
       const stateProvider = this.createStateProvider();
       this.recordLayerOperation('state_provider_created', true);
 
-      // Execute scenario steps
+      // Execute scenario steps (internal - ScenarioManager retained)
       const scenarioResult = await this.scenarioManager.execute(stateProvider);
       this.recordLayerOperation('steps_executed', scenarioResult.status !== 'failed');
       this.recordLayerOperation('state_transitions_recorded', true);
@@ -274,32 +339,123 @@ export class SimulationEngine {
       this.endLayer('core', true);
 
       // ========================================================================
-      // VALIDATION LAYER - Post-execution validation (optional)
+      // VALIDATION LAYER - Post-execution validation
+      // Delegates: Policy aggregation → LLM-Security-Core
+      //            Cost attribution → LLM-Data-Core
+      //            Governance → LLM-Governance-Core
       // ========================================================================
       this.startLayer('validation');
       this.state.phase = 'teardown';
       this.context.recordLifecycleEvent('layer_started', { layer: 'validation' });
       this.context.recordLifecycleEvent('phase_started', { phase: 'analysis' });
 
-      // Build policy results
-      const policyResult = this.buildPolicyResult();
-      this.recordLayerOperation('policy_results_aggregated', true);
+      // DELEGATE: Post-execution policy aggregation to LLM-Security-Core
+      const securityPostResult = await this.delegateToCore<
+        SecurityCoreRequest,
+        SecurityCoreResponse
+      >(this.coreClients.security, 'validation.policy_aggregation', {
+        coreType: 'llm-security-core',
+        phase: 'post-execution',
+        policyReferences: this.config.policies.map((p) => ({
+          policyId: p.policyId as string,
+          version: p.version,
+        })),
+        evaluationContext: {
+          scenarioResult: {
+            status: scenarioResult.status,
+            stepCount: scenarioResult.stepResults.length,
+          },
+          stepResults: scenarioResult.stepResults,
+        },
+        stateSnapshot: this.stateData,
+      });
+      this.recordLayerOperation('policy_results_aggregated', securityPostResult.success);
 
-      // Compute metrics
-      const metrics = this.computeMetrics();
-      this.recordLayerOperation('metrics_computed', true);
+      // DELEGATE: Cost attribution to LLM-Data-Core
+      const dataResult = await this.delegateToCore<
+        DataCoreRequest,
+        DataCoreResponse
+      >(this.coreClients.data, 'validation.cost_attribution', {
+        coreType: 'llm-data-core',
+        entityReferences: this.config.dataSources.map((ds) => ({
+          entityType: ds.type,
+          entityId: ds.id,
+        })),
+        executionSummary: {
+          scenarioId: this.config.scenario.scenarioId,
+          stepResults: scenarioResult.stepResults,
+          status: scenarioResult.status,
+        },
+      });
+      this.recordLayerOperation('cost_attribution_delegated', dataResult.success);
+
+      // DELEGATE: Governance validation to LLM-Governance-Core
+      const governanceResult = await this.delegateToCore<
+        GovernanceCoreRequest,
+        GovernanceCoreResponse
+      >(this.coreClients.governance, 'validation.governance', {
+        coreType: 'llm-governance-core',
+        policyResults: securityPostResult.policyResult,
+        scenarioResults: {
+          status: scenarioResult.status,
+          stepResults: scenarioResult.stepResults,
+          expectationResults: scenarioResult.expectationResults,
+          coverage: scenarioResult.coverage,
+        },
+      });
+      this.recordLayerOperation('governance_validated', governanceResult.success);
+
+      // Use delegated results
+      const policyResult = governanceResult.validatedPolicyResult;
+      const metrics = this.mergeMetrics(
+        this.computeBaseMetrics(),
+        dataResult.executionMetrics
+      );
 
       this.endLayer('validation', true);
 
       // ========================================================================
-      // ARTIFACT LAYER - Generate artifacts (optional)
+      // ARTIFACT LAYER - Generate artifacts
+      // Delegates: Artifact generation → LLM-Automation-Core
       // ========================================================================
       this.startLayer('artifact');
       this.context.recordLifecycleEvent('layer_started', { layer: 'artifact' });
       this.context.recordLifecycleEvent('phase_started', { phase: 'export' });
 
-      const artifacts = await this.generateArtifacts();
-      this.recordLayerOperation('artifacts_generated', true);
+      // DELEGATE: Artifact generation to LLM-Automation-Core
+      const automationResult = await this.delegateToCore<
+        AutomationCoreRequest,
+        AutomationCoreResponse
+      >(this.coreClients.automation, 'artifact.generation', {
+        coreType: 'llm-automation-core',
+        simulationResult: {
+          simulationId: this.config.simulationId,
+          status: this.determineOutcome(scenarioResult),
+          scenarioResult: {
+            status: scenarioResult.status,
+            coverage: scenarioResult.coverage,
+          },
+          policyResult,
+          metrics,
+        },
+        simulationConfig: {
+          simulationId: this.config.simulationId,
+          scenario: this.config.scenario,
+          policies: this.config.policies,
+          resourceLimits: this.config.resourceLimits,
+          artifactConfig: this.config.artifactConfig,
+        },
+        artifactConfig: {
+          generateReport: this.config.artifactConfig.generateReport,
+          generatePolicyLog: this.config.artifactConfig.generatePolicyLog,
+          generateStateSnapshots: this.config.artifactConfig.generateStateSnapshots,
+          generateTrace: this.config.artifactConfig.generateTrace,
+          formats: [...this.config.artifactConfig.formats],
+        },
+      });
+      this.recordLayerOperation('artifacts_generated', automationResult.success);
+
+      const artifacts = automationResult.artifacts;
 
       this.endLayer('artifact', true);
 
@@ -309,6 +465,9 @@ export class SimulationEngine {
       this.state.status = 'completed';
       this.state.phase = 'completed';
       this.state.endTime = new Date();
+
+      // End root span
+      this.rootSpan.end();
 
       const timing = this.computeTiming();
       const executionProof = this.buildExecutionProof();
@@ -345,10 +504,19 @@ export class SimulationEngine {
 
       return result;
     } catch (error) {
+      // End root span as failed if active
+      if (this.rootSpan?.isActive) {
+        this.rootSpan.fail(error instanceof Error ? error : String(error));
+      }
+
       // End current layer as failed if one is in progress
       if (this.state.currentLayer) {
         this.endLayer(this.state.currentLayer, false, {
-          code: error instanceof SimulationEngineError ? error.code : 'EXECUTION_ERROR',
+          code: error instanceof SimulationEngineError
+            ? error.code
+            : error instanceof CoreDelegationError
+              ? error.code
+              : 'EXECUTION_ERROR',
           message: error instanceof Error ? error.message : String(error),
         });
       }
@@ -362,6 +530,107 @@ export class SimulationEngine {
         { phase: this.state.phase }
       );
 
+      throw error;
+    }
+  }
+
+  // ==========================================================================
+  // CORE DELEGATION
+  // ==========================================================================
+
+  /**
+   * Delegates work to an external Agentics Core with full span propagation
+   * and response validation.
+   *
+   * Creates a child span under the root simulation span, propagates the
+   * SpanContext (traceId + parentSpanId), calls the Core, validates the
+   * response span hierarchy, and ingests the Core's spans into the
+   * trace collector.
+   *
+   * REJECTS flat results: If the Core returns a response without proper
+   * nested repo + agent spans, a CoreDelegationError is thrown.
+   *
+   * @param client - The Core client to call
+   * @param operationName - Operation name for the span
+   * @param requestData - Core-specific request data (span context auto-filled)
+   * @returns The Core's response
+   * @throws CoreDelegationError if response has flat/missing spans
+   */
+  private async delegateToCore<
+    TReq extends CoreRequest,
+    TRes extends CoreResponse,
+  >(
+    client: CoreClient<TReq, TRes>,
+    operationName: string,
+    requestData: Omit<
+      TReq,
+      'simulationId' | 'traceId' | 'parentSpanId' | 'requestedAt' | 'timeoutMs'
+    >
+  ): Promise<TRes> {
+    // 1. Create a child span for the Core call
+    const coreSpan = this.rootSpan!.startChild(
+      `core.${client.coreName}.${operationName}`
+    );
+    coreSpan.setAttribute('core.name', client.coreName);
+    coreSpan.setAttribute('core.operation', operationName);
+
+    const spanContext = extractSpanContext(coreSpan);
+
+    // 2. Build the full request with propagated span context
+    const request = {
+      ...requestData,
+      simulationId: this.config!.simulationId,
+      traceId: spanContext.traceId,
+      parentSpanId: spanContext.spanId,
+      requestedAt: this.context!.getTime(),
+      timeoutMs: 30000,
+    } as TReq;
+
+    try {
+      // 3. Call the external Core
+      const response = await client.call(request);
+
+      // 4. Validate span hierarchy in response (REJECT flat results)
+      const validation = validateCoreSpanHierarchy(
+        response.spanHierarchy,
+        spanContext.spanId,
+        spanContext.traceId,
+        client.coreName
+      );
+
+      if (!validation.valid) {
+        coreSpan.fail(
+          new Error(`Flat span hierarchy from ${client.coreName}`)
+        );
+        throw new CoreDelegationError(
+          `Core ${client.coreName} returned flat results`,
+          'FLAT_SPAN_HIERARCHY',
+          client.coreName,
+          validation.errors.map((e) => e.message).join('; '),
+          validation
+        );
+      }
+
+      // 5. Record Core's response metadata on the span
+      coreSpan.setAttribute('core.durationMs', response.durationMs);
+      coreSpan.setAttribute('core.success', response.success);
+      coreSpan.setAttribute(
+        'core.spans.repo',
+        response.spanHierarchy.repoSpan.spanId
+      );
+      coreSpan.setAttribute(
+        'core.spans.agentCount',
+        response.spanHierarchy.agentSpans.length
+      );
+
+      // 6. End the Core span successfully
+      coreSpan.end();
+
+      return response;
+    } catch (error) {
+      if (coreSpan.isActive) {
+        coreSpan.fail(error instanceof Error ? error : String(error));
+      }
       throw error;
     }
   }
@@ -420,7 +689,7 @@ export class SimulationEngine {
       error,
       inputHash,
       outputHash,
-      operations: [], // Operations would be tracked here in a more detailed implementation
+      operations: [],
     };
 
     this.state.layerRecords.push(record);
@@ -526,6 +795,11 @@ export class SimulationEngine {
       reason,
       previousStatus,
     });
+
+    // End root span if active
+    if (this.rootSpan?.isActive) {
+      this.rootSpan.cancel(reason);
+    }
 
     // Clean shutdown within 5 seconds (F-006 requirement)
     await this.cleanup();
@@ -688,30 +962,10 @@ export class SimulationEngine {
   }
 
   /**
-   * Builds policy result from evaluation history.
+   * Computes base execution metrics from internal context.
+   * Cost-related metrics come from LLM-Data-Core.
    */
-  private buildPolicyResult(): PolicyResult {
-    const stats = this.policyEngine?.getStatistics();
-    const history = this.policyEngine?.getDecisionHistory() ?? [];
-
-    return {
-      policiesEvaluated: stats?.loadedPolicies ?? 0,
-      decisionCounts: stats?.outcomeBreakdown ?? {
-        allow: 0,
-        deny: 0,
-        warn: 0,
-        require_approval: 0,
-      },
-      violations: [],
-      complianceScore: 100,
-      policyResults: [],
-    };
-  }
-
-  /**
-   * Computes execution metrics.
-   */
-  private computeMetrics(): ExecutionMetrics {
+  private computeBaseMetrics(): ExecutionMetrics {
     const contextSummary = this.context?.getSummary();
 
     return {
@@ -721,6 +975,27 @@ export class SimulationEngine {
       peakMemoryBytes: contextSummary?.resourceUsage.memoryBytes ?? 0,
       externalCalls: 0,
       determinismVerified: true,
+    };
+  }
+
+  /**
+   * Merges internal base metrics with metrics from LLM-Data-Core.
+   */
+  private mergeMetrics(
+    base: ExecutionMetrics,
+    coreMetrics: Partial<ExecutionMetrics>
+  ): ExecutionMetrics {
+    return {
+      totalEvents: coreMetrics.totalEvents ?? base.totalEvents,
+      stateTransitions: coreMetrics.stateTransitions ?? base.stateTransitions,
+      snapshotsCreated: coreMetrics.snapshotsCreated ?? base.snapshotsCreated,
+      peakMemoryBytes: coreMetrics.peakMemoryBytes ?? base.peakMemoryBytes,
+      externalCalls: (base.externalCalls) + (coreMetrics.externalCalls ?? 0),
+      determinismVerified: base.determinismVerified && (coreMetrics.determinismVerified ?? true),
+      custom: {
+        ...base.custom,
+        ...coreMetrics.custom,
+      },
     };
   }
 
@@ -763,21 +1038,6 @@ export class SimulationEngine {
   }
 
   /**
-   * Generates artifacts (placeholder).
-   */
-  private async generateArtifacts(): Promise<ArtifactManifest> {
-    // Artifact generation will be implemented in Phase 9
-    return {
-      simulationId: this.config!.simulationId,
-      generatedAt: this.context!.getTime(),
-      artifacts: [],
-      totalSizeBytes: 0,
-      checksums: {},
-      manifestHash: createContentHashFromObject({ empty: true }),
-    };
-  }
-
-  /**
    * Builds result metadata.
    */
   private buildResultMetadata(): ResultMetadata {
@@ -801,7 +1061,6 @@ export class SimulationEngine {
   private async cleanup(): Promise<void> {
     this.context?.dispose();
     this.scenarioManager?.reset();
-    this.policyEngine?.reset();
   }
 }
 

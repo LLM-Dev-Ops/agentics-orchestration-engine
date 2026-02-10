@@ -96,6 +96,25 @@ export {
 // Re-export artifact generation
 export * from './artifact/index.js';
 
+// Re-export core delegation (external Agentics Core interfaces)
+export {
+  type CoreClient,
+  type SecurityCoreClient,
+  type DataCoreClient,
+  type AutomationCoreClient,
+  type GovernanceCoreClient,
+  type CoreClientRegistry,
+  type CoreHealth,
+  validateCoreSpanHierarchy,
+  CoreDelegationError,
+  MockSecurityCoreClient,
+  MockDataCoreClient,
+  MockAutomationCoreClient,
+  MockGovernanceCoreClient,
+  createMockCoreClientRegistry,
+  type MockCoreConfig,
+} from './integration/cores/index.js';
+
 // Version information
 export const VERSION = '0.1.0';
 export const ENGINE_NAME = 'agentics-simulation-engine';

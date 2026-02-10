@@ -12,6 +12,7 @@
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { createSimulationEngine } from './core/engine.js';
+import { createMockCoreClientRegistry } from './integration/cores/mock-cores.js';
 import type { SimulationConfig, SimulationResult } from './types/simulation.js';
 import type { Scenario } from './types/scenario.js';
 import type { ISOTimestamp } from './types/common.js';
@@ -626,9 +627,10 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
       ? { ...createDefaultConfig(body.scenario), ...body.config }
       : createDefaultConfig(body.scenario);
 
-    // Create and initialize engine
+    // Create and initialize engine with Core clients
+    const coreClients = createMockCoreClientRegistry();
     const engine = createSimulationEngine();
-    await engine.initialize(config);
+    await engine.initialize(config, coreClients);
 
     // Execute simulation
     const result = await engine.execute(body.scenario);

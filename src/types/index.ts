@@ -29,3 +29,6 @@ export * from './artifact.js';
 
 // Tracing
 export * from './trace.js';
+
+// Core delegation types
+export * from './core-delegation.js';
