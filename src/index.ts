@@ -1,12 +1,14 @@
 /**
- * Agentics Simulation Engine
+ * Agentics Orchestration Engine
  *
- * A deterministic, enterprise-grade decision simulation system that:
- * - Consumes normalized data from erp-surface (read-only)
- * - Applies policies and orchestration logic
- * - Generates counterfactual execution paths
- * - Produces implementation-ready artifacts
- * - Operates in complete isolation from production systems
+ * A pure orchestration and delegation layer that:
+ * - Accepts scenarios and requests execution acceptance from ruvector
+ * - Delegates ALL execution to downstream Agentics Cores
+ * - Propagates spans under ruvector's root span
+ * - Collates execution graphs from delegation results
+ *
+ * This service is a conductor, not an engine.
+ * It MUST NOT mint execution_id or execute simulation logic internally.
  *
  * @packageDocumentation
  */
@@ -116,5 +118,5 @@ export {
 } from './integration/cores/index.js';
 
 // Version information
-export const VERSION = '0.1.0';
-export const ENGINE_NAME = 'agentics-simulation-engine';
+export const VERSION = '0.2.0';
+export const ENGINE_NAME = 'agentics-orchestration-engine';

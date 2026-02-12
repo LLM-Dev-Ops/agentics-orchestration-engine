@@ -11,6 +11,8 @@ import type { ISOTimestamp } from '../types/common.js';
 import type {
   DecisionEvent,
   ExecutionLifecycleEvent,
+  ExecutionAcceptanceRequest,
+  ExecutionAcceptanceResponse,
   RuvectorClientConfig,
   RuvectorConnectionStatus,
   RuvectorEventId,
@@ -247,6 +249,83 @@ export class RuvectorClient {
         'EMIT_ERROR',
         error instanceof Error ? error.message : String(error)
       );
+    }
+  }
+
+  /**
+   * Requests execution acceptance from ruvector-service.
+   *
+   * BLOCKING: This call blocks until ruvector responds with acceptance or rejection.
+   * The ruvector-minted execution_id becomes the canonical ID for the entire execution.
+   *
+   * @param request - Execution acceptance request
+   * @returns Acceptance response with ruvector-minted execution_id
+   * @throws RuvectorClientError if not connected, request fails, or times out
+   */
+  async requestExecutionAcceptance(
+    request: ExecutionAcceptanceRequest
+  ): Promise<ExecutionAcceptanceResponse> {
+    if (!this.isConnected) {
+      throw new RuvectorClientError(
+        'Cannot request execution acceptance: not connected',
+        'NOT_CONNECTED',
+        'Call connect() before requesting execution acceptance'
+      );
+    }
+
+    console.log('[RuvectorClient] Requesting execution acceptance', {
+      simulation_id: request.simulation_id,
+      plan_id: request.plan_id,
+      source: request.source,
+    });
+
+    const timeout = this.config.connectionTimeoutMs ?? 10000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const response = await fetch(
+        `${this.config.endpoint}/executions/accept`,
+        {
+          method: 'POST',
+          headers: {
+            ...this.getAuthHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(request),
+          signal: controller.signal,
+        }
+      );
+
+      if (!response.ok) {
+        throw new RuvectorClientError(
+          `Execution acceptance request failed: ${response.status} ${response.statusText}`,
+          'ACCEPTANCE_REQUEST_FAILED',
+          `HTTP ${response.status}`
+        );
+      }
+
+      const data = (await response.json()) as ExecutionAcceptanceResponse;
+      return data;
+    } catch (error) {
+      if (error instanceof RuvectorClientError) {
+        throw error;
+      }
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new RuvectorClientError(
+          'Execution acceptance request timed out',
+          'ACCEPTANCE_TIMEOUT',
+          `Timed out after ${timeout}ms waiting for ruvector acceptance`
+        );
+      }
+      this.updateStatus({ errors: this.status.errors + 1 });
+      throw new RuvectorClientError(
+        'Failed to request execution acceptance',
+        'ACCEPTANCE_ERROR',
+        error instanceof Error ? error.message : String(error)
+      );
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 

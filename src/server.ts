@@ -1,22 +1,33 @@
 /**
- * HTTP Server for Agentics Simulation Engine
+ * HTTP Server for Agentics Orchestration Engine
  *
- * Exposes the simulation engine via REST API for Cloud Run deployment.
- * Enforces contract validation at the earliest HTTP entry point.
+ * Exposes the orchestration engine via REST API for Cloud Run deployment.
+ * This service is a CONDUCTOR, not an engine. It delegates all execution
+ * to downstream Agentics Cores after receiving execution acceptance from ruvector.
  *
  * CRITICAL: All /v1/simulate responses MUST include execution_metadata.
- * This is enforced through the centralized SimulateResponse helper.
+ * CRITICAL: This service MUST NOT mint execution_id — ruvector does.
  *
  * @module server
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { createSimulationEngine } from './core/engine.js';
+import {
+  createOrchestrationEngine,
+  OrchestrationError,
+  type OrchestrationConfig,
+} from './core/engine.js';
 import { createMockCoreClientRegistry } from './integration/cores/mock-cores.js';
 import type { SimulationConfig, SimulationResult } from './types/simulation.js';
 import type { Scenario } from './types/scenario.js';
-import type { ISOTimestamp } from './types/common.js';
-import { v4 as uuidv4 } from 'uuid';
+import type { ExecutionId, ISOTimestamp, SimulationId } from './types/common.js';
+import { createSimulationId } from './types/common.js';
+import {
+  RuvectorClient,
+  createRuvectorClient,
+  RuvectorClientError,
+} from './ruvector/client.js';
+import type { RuvectorClientConfig } from './ruvector/types.js';
 import {
   validateSimulateRequest,
   formatValidationErrors,
@@ -27,19 +38,14 @@ import {
 // CONSTANTS
 // ============================================================================
 
-const SERVICE_NAME = 'agentics-simulation-engine';
-const SERVICE_VERSION = '0.1.0';
-// Unique service identifier for debugging which service responds to CLI
-const SERVICE_INSTANCE_ID = `engine-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+const SERVICE_NAME = 'agentics-orchestration-engine';
+const SERVICE_VERSION = '0.2.0';
+const SERVICE_INSTANCE_ID = `orchestrator-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
 // ============================================================================
 // DIAGNOSTIC LOGGING
 // ============================================================================
 
-/**
- * Logs response details for debugging CLI contract issues.
- * CRITICAL: This helps identify which service/handler is responding.
- */
 function logResponse(context: string, statusCode: number, hasExecutionMetadata: boolean, responsePreview?: string): void {
   console.log(`[RESPONSE-DEBUG] ${new Date().toISOString()}`);
   console.log(`  Service: ${SERVICE_NAME}`);
@@ -65,16 +71,14 @@ interface HealthResponse {
   status: 'healthy' | 'unhealthy';
   version: string;
   timestamp: string;
+  mode: 'orchestration';
 }
 
-/**
- * Execution metadata - REQUIRED on ALL /v1/simulate responses.
- * This is the contract enforcement point for CLI compatibility.
- */
 interface ExecutionMetadata {
   service: string;
   version: string;
   timestamp: string;
+  execution_id: string | null;
   simulation_id: string | null;
   status: 'error' | 'success' | 'partial_success' | 'failure' | 'timeout' | 'cancelled';
   error_code?: string;
@@ -83,13 +87,10 @@ interface ExecutionMetadata {
   layers_executed?: readonly string[];
   proof_hash?: unknown;
   mandatory_layers_complete?: boolean;
-  // Debug field to identify which service instance is responding
+  delegation_count?: number;
   _debug_service_instance?: string;
 }
 
-/**
- * Error response structure with MANDATORY execution_metadata.
- */
 interface SimulateErrorResponse {
   error: {
     code: string;
@@ -99,28 +100,19 @@ interface SimulateErrorResponse {
   execution_metadata: ExecutionMetadata;
 }
 
-/**
- * Success response structure with MANDATORY execution_metadata.
- */
 interface SimulateSuccessResponse {
   success: true;
   result: SimulationResult;
+  execution_id: string;
   execution_metadata: ExecutionMetadata;
 }
 
-/**
- * Union type for ALL simulate responses - guarantees execution_metadata.
- */
 type SimulateResponse = SimulateErrorResponse | SimulateSuccessResponse;
 
 // ============================================================================
 // REQUEST NORMALIZATION
 // ============================================================================
 
-/**
- * Normalizes incoming request to match the strict schema format.
- * Transforms simplified payloads from upstream services into compliant format.
- */
 function normalizeRequest(input: unknown): unknown {
   if (!input || typeof input !== 'object') {
     return input;
@@ -128,19 +120,17 @@ function normalizeRequest(input: unknown): unknown {
 
   const raw = input as Record<string, unknown>;
 
-  // Extract scenario from input (may be nested or at root)
   let scenario = raw['scenario'] as Record<string, unknown> | undefined;
 
-  // If no scenario property, check if the input itself looks like a scenario
   if (!scenario && raw['scenarioId']) {
     scenario = raw as Record<string, unknown>;
   }
 
   if (!scenario) {
-    return input; // Let validation handle missing scenario
+    return input;
   }
 
-  // Normalize version - convert string to object
+  // Normalize version
   let version = scenario['version'];
   if (typeof version === 'string') {
     const parts = version.split('.').map(Number);
@@ -153,14 +143,14 @@ function normalizeRequest(input: unknown): unknown {
     version = { major: 1, minor: 0, patch: 0 };
   }
 
-  // Normalize category - default to 'custom' if invalid
+  // Normalize category
   const validCategories = ['deployment', 'policy', 'integration', 'failure', 'performance', 'compliance', 'migration', 'what-if', 'custom'];
   let category = scenario['category'];
   if (!category || !validCategories.includes(category as string)) {
     category = 'custom';
   }
 
-  // Normalize preconditions - ensure array of objects
+  // Normalize preconditions
   let preconditions = scenario['preconditions'];
   if (!Array.isArray(preconditions)) {
     preconditions = [];
@@ -182,7 +172,7 @@ function normalizeRequest(input: unknown): unknown {
     });
   }
 
-  // Normalize setup - ensure array
+  // Normalize setup
   let setup = scenario['setup'];
   if (!Array.isArray(setup)) {
     setup = [];
@@ -203,10 +193,9 @@ function normalizeRequest(input: unknown): unknown {
     });
   }
 
-  // Normalize steps - ensure array with required fields
+  // Normalize steps
   let steps = scenario['steps'];
   if (!Array.isArray(steps)) {
-    // Create a minimal step if none provided
     steps = [{
       stepId: 'step-1',
       name: 'Default Step',
@@ -218,7 +207,6 @@ function normalizeRequest(input: unknown): unknown {
     steps = steps.map((s, i) => {
       if (typeof s === 'object' && s !== null) {
         const st = s as Record<string, unknown>;
-        // Build a clean step object with only valid properties
         const normalizedStep: Record<string, unknown> = {
           stepId: st['stepId'] ?? st['id'] ?? `step-${i}`,
           name: st['name'] ?? `Step ${i}`,
@@ -226,7 +214,6 @@ function normalizeRequest(input: unknown): unknown {
           type: st['type'] ?? 'custom',
           config: st['config'] ?? {},
         };
-        // Copy over optional valid properties
         if (st['description']) normalizedStep['description'] = st['description'];
         if (st['when']) normalizedStep['when'] = st['when'];
         if (st['retry']) normalizedStep['retry'] = st['retry'];
@@ -241,7 +228,7 @@ function normalizeRequest(input: unknown): unknown {
     });
   }
 
-  // Normalize teardown - ensure array
+  // Normalize teardown
   let teardown = scenario['teardown'];
   if (!Array.isArray(teardown)) {
     teardown = [];
@@ -262,7 +249,7 @@ function normalizeRequest(input: unknown): unknown {
     });
   }
 
-  // Normalize expectations - ensure array
+  // Normalize expectations
   let expectations = scenario['expectations'];
   if (!Array.isArray(expectations)) {
     expectations = [];
@@ -283,7 +270,6 @@ function normalizeRequest(input: unknown): unknown {
     });
   }
 
-  // Build normalized scenario
   const normalizedScenario: Record<string, unknown> = {
     scenarioId: scenario['scenarioId'] ?? scenario['id'] ?? `scenario-${Date.now()}`,
     version,
@@ -298,7 +284,6 @@ function normalizeRequest(input: unknown): unknown {
     expectations,
   };
 
-  // Copy optional fields if present
   if (scenario['parameterDefinitions']) normalizedScenario['parameterDefinitions'] = scenario['parameterDefinitions'];
   if (scenario['defaultParameters']) normalizedScenario['defaultParameters'] = scenario['defaultParameters'];
   if (scenario['postconditions']) normalizedScenario['postconditions'] = scenario['postconditions'];
@@ -310,7 +295,6 @@ function normalizeRequest(input: unknown): unknown {
   if (scenario['updatedAt']) normalizedScenario['updatedAt'] = scenario['updatedAt'];
   if (scenario['contentHash']) normalizedScenario['contentHash'] = scenario['contentHash'];
 
-  // Return normalized request with only scenario and config (no extra properties)
   const result: Record<string, unknown> = {
     scenario: normalizedScenario,
   };
@@ -323,12 +307,9 @@ function normalizeRequest(input: unknown): unknown {
 }
 
 // ============================================================================
-// HELPERS - LOW LEVEL (Internal use only)
+// HELPERS
 // ============================================================================
 
-/**
- * Reads JSON body from request
- */
 async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -354,11 +335,6 @@ async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   });
 }
 
-/**
- * Low-level JSON response sender.
- * INTERNAL USE ONLY - Do not use directly for /v1/simulate responses.
- * Use sendSimulateResponse() instead to guarantee execution_metadata.
- */
 function _sendJsonInternal(res: ServerResponse, statusCode: number, data: unknown): void {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json',
@@ -370,20 +346,13 @@ function _sendJsonInternal(res: ServerResponse, statusCode: number, data: unknow
 // ============================================================================
 // CENTRALIZED SIMULATE RESPONSE HELPER
 // ============================================================================
-// CRITICAL: ALL /v1/simulate responses MUST go through this helper.
-// This is the SINGLE enforcement point for execution_metadata.
-// ============================================================================
 
-/**
- * Creates execution_metadata for error responses.
- * Guarantees all required fields are present.
- * Includes debug instance ID to help trace which service responds.
- */
 function createErrorExecutionMetadata(code: string, phase: string): ExecutionMetadata {
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
     timestamp: new Date().toISOString(),
+    execution_id: null,
     simulation_id: null,
     status: 'error',
     error_code: code,
@@ -392,16 +361,15 @@ function createErrorExecutionMetadata(code: string, phase: string): ExecutionMet
   };
 }
 
-/**
- * Creates execution_metadata for success responses.
- * Extracts proof data from simulation result.
- * Includes debug instance ID to help trace which service responds.
- */
-function createSuccessExecutionMetadata(result: SimulationResult): ExecutionMetadata {
+function createSuccessExecutionMetadata(
+  result: SimulationResult,
+  executionId: ExecutionId
+): ExecutionMetadata {
   return {
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
     timestamp: new Date().toISOString(),
+    execution_id: executionId,
     simulation_id: result.simulationId,
     status: result.status,
     execution_proof: result.executionProof,
@@ -412,27 +380,15 @@ function createSuccessExecutionMetadata(result: SimulationResult): ExecutionMeta
   };
 }
 
-/**
- * CENTRALIZED SIMULATE RESPONSE SENDER
- *
- * This is the ONLY function that should be used to send responses for /v1/simulate.
- * It GUARANTEES that execution_metadata is present on every response.
- *
- * The type system enforces that the response must be a SimulateResponse,
- * which requires execution_metadata to be present.
- */
 function sendSimulateResponse(res: ServerResponse, statusCode: number, response: SimulateResponse): void {
-  // Runtime validation - belt and suspenders
   if (!response.execution_metadata) {
     console.error('CRITICAL: Attempted to send simulate response without execution_metadata');
-    // Inject emergency execution_metadata to prevent contract violation
     (response as SimulateErrorResponse).execution_metadata = createErrorExecutionMetadata(
       'INTERNAL_METADATA_ERROR',
       'response'
     );
   }
 
-  // DIAGNOSTIC LOGGING - helps identify if this service is the responder
   const responseStr = JSON.stringify(response);
   const hasMetadata = !!response.execution_metadata;
   const context = 'error' in response ? `error:${response.error.code}` : 'success';
@@ -441,10 +397,6 @@ function sendSimulateResponse(res: ServerResponse, statusCode: number, response:
   _sendJsonInternal(res, statusCode, response);
 }
 
-/**
- * Sends a simulate error response with guaranteed execution_metadata.
- * This is the PRIMARY error response function for /v1/simulate.
- */
 function sendSimulateError(
   res: ServerResponse,
   statusCode: number,
@@ -464,23 +416,20 @@ function sendSimulateError(
   sendSimulateResponse(res, statusCode, response);
 }
 
-/**
- * Sends a simulate success response with guaranteed execution_metadata.
- * This is the PRIMARY success response function for /v1/simulate.
- */
-function sendSimulateSuccess(res: ServerResponse, result: SimulationResult): void {
+function sendSimulateSuccess(
+  res: ServerResponse,
+  result: SimulationResult,
+  executionId: ExecutionId
+): void {
   const response: SimulateSuccessResponse = {
     success: true,
     result,
-    execution_metadata: createSuccessExecutionMetadata(result),
+    execution_id: executionId,
+    execution_metadata: createSuccessExecutionMetadata(result, executionId),
   };
   sendSimulateResponse(res, 200, response);
 }
 
-/**
- * Sends a contract violation error response with guaranteed execution_metadata.
- * Used when request validation fails.
- */
 function sendContractViolation(
   res: ServerResponse,
   errors: ReadonlyArray<ContractValidationError>
@@ -500,10 +449,12 @@ function sendContractViolation(
 }
 
 /**
- * Creates a default simulation config
+ * Creates a default simulation config.
+ * NOTE: No execution_id is minted here. The simulationId is a scenario reference only.
+ * The canonical execution_id comes from ruvector acceptance.
  */
 function createDefaultConfig(scenario: Scenario): SimulationConfig {
-  const simulationId = `sim-${uuidv4()}` as SimulationConfig['simulationId'];
+  const simulationId = createSimulationId(`scenario-ref-${scenario.scenarioId}`);
   const now = new Date().toISOString() as ISOTimestamp;
 
   return {
@@ -514,8 +465,8 @@ function createDefaultConfig(scenario: Scenario): SimulationConfig {
     },
     policies: [],
     resourceLimits: {
-      maxExecutionTimeMs: 120000, // 2 minutes
-      maxMemoryBytes: 512 * 1024 * 1024, // 512MB
+      maxExecutionTimeMs: 120000,
+      maxMemoryBytes: 512 * 1024 * 1024,
       maxConcurrency: 4,
       maxSnapshots: 100,
       maxTraceEvents: 10000,
@@ -548,18 +499,35 @@ function createDefaultConfig(scenario: Scenario): SimulationConfig {
 }
 
 // ============================================================================
-// ROUTE HANDLERS
+// RUVECTOR CLIENT SETUP
 // ============================================================================
 
 /**
- * Health check endpoint - does NOT require execution_metadata
- * (only /v1/simulate requires it)
+ * Creates a RuvectorClient from environment variables.
+ * Falls back to a mock configuration for development.
  */
+function createRuvectorClientFromEnv(): RuvectorClient {
+  const endpoint = process.env['RUVECTOR_ENDPOINT'] ?? 'http://localhost:8081';
+  const config: RuvectorClientConfig = {
+    endpoint,
+    credentialsRef: process.env['RUVECTOR_CREDENTIALS_REF'] ?? 'ruvector-api-key',
+    clientId: process.env['RUVECTOR_CLIENT_ID'] ?? SERVICE_INSTANCE_ID,
+    mode: 'polling',
+    connectionTimeoutMs: parseInt(process.env['RUVECTOR_TIMEOUT_MS'] ?? '10000', 10),
+  };
+  return createRuvectorClient(config);
+}
+
+// ============================================================================
+// ROUTE HANDLERS
+// ============================================================================
+
 function handleHealth(res: ServerResponse): void {
   const health: HealthResponse = {
     status: 'healthy',
     version: SERVICE_VERSION,
     timestamp: new Date().toISOString(),
+    mode: 'orchestration',
   };
   _sendJsonInternal(res, 200, health);
 }
@@ -567,21 +535,23 @@ function handleHealth(res: ServerResponse): void {
 /**
  * Simulate endpoint - POST /v1/simulate
  *
- * CRITICAL: Contract validation occurs at the earliest entry point.
- * Invalid requests MUST fail before any engine initialization,
- * scenario loading, or execution begins.
+ * ORCHESTRATION FLOW:
+ * 1. Validate request contract
+ * 2. Request execution acceptance from ruvector (BLOCKING)
+ * 3. Delegate ALL work to downstream cores using ruvector-minted execution_id
+ * 4. Return collated result with execution_id
  *
- * ALL responses from this handler use the centralized sendSimulate* functions
- * to GUARANTEE execution_metadata is present.
+ * This handler MUST NOT:
+ * - Mint execution_id
+ * - Execute simulation logic
+ * - Perform policy evaluation, cost computation, artifact generation, or validation math
  */
 async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  // Validate method - use centralized error handler
   if (req.method !== 'POST') {
     sendSimulateError(res, 405, 'METHOD_NOT_ALLOWED', 'Only POST method is allowed', 'request');
     return;
   }
 
-  // Parse request body first
   let rawBody: unknown;
   try {
     rawBody = await readJsonBody<unknown>(req);
@@ -600,63 +570,67 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     return;
   }
 
-  // DIAGNOSTIC LOGGING - Log full request body for debugging
   console.log("SIMULATE BODY (raw):", JSON.stringify(rawBody, null, 2));
 
-  // NORMALIZE REQUEST - Transform simplified payloads to strict schema format
   const normalizedBody = normalizeRequest(rawBody);
   console.log("SIMULATE BODY (normalized):", JSON.stringify(normalizedBody, null, 2));
 
   // CONTRACT VALIDATION - EARLIEST ENTRY POINT
-  // Validate against simulation/v1/request.schema.json with strict Ajv validation.
-  // No engine initialization, scenario loading, or execution may occur before this.
   const validation = validateSimulateRequest(normalizedBody);
   if (!validation.valid) {
-    // Contract violation - use centralized handler with guaranteed execution_metadata
     sendContractViolation(res, validation.errors);
     return;
   }
 
-  // Type assertion is now safe after schema validation
   const body = normalizedBody as SimulateRequest;
 
   try {
-    // Create configuration - no manual field checks needed
-    // Schema validation guarantees scenario exists and has required structure
-    const config = body.config
+    const simConfig = body.config
       ? { ...createDefaultConfig(body.scenario), ...body.config }
       : createDefaultConfig(body.scenario);
 
-    // Create and initialize engine with Core clients
+    // Create orchestration engine and initialize with ruvector + core clients
+    const ruvectorClient = createRuvectorClientFromEnv();
     const coreClients = createMockCoreClientRegistry();
-    const engine = createSimulationEngine();
-    await engine.initialize(config, coreClients);
+    const engine = createOrchestrationEngine();
+    engine.initialize(ruvectorClient, coreClients);
 
-    // Execute simulation
-    const result = await engine.execute(body.scenario);
+    // Build orchestration config — NO execution_id minted here
+    const orchestrationConfig: OrchestrationConfig = {
+      simulationId: simConfig.simulationId,
+      simulationConfig: simConfig,
+      scenario: body.scenario,
+      engineId: SERVICE_INSTANCE_ID,
+    };
 
-    // Send success response with guaranteed execution_metadata
-    sendSimulateSuccess(res, result);
+    // Orchestrate — blocks until ruvector acceptance, delegates everything
+    const orchestrationResult = await engine.orchestrate(orchestrationConfig);
+
+    // Return with ruvector-minted execution_id
+    sendSimulateSuccess(res, orchestrationResult.result, orchestrationResult.executionId);
   } catch (error) {
-    // DIAGNOSTIC LOGGING - Log full error details for debugging
-    console.error("SIMULATION ERROR:", error);
-    console.error("SIMULATION ERROR (stringified):", JSON.stringify(error, Object.getOwnPropertyNames(error ?? {}), 2));
+    console.error("ORCHESTRATION ERROR:", error);
     if (error instanceof Error && error.stack) {
-      console.error("SIMULATION ERROR STACK:", error.stack);
+      console.error("ORCHESTRATION ERROR STACK:", error.stack);
     }
 
-    // Use centralized error handler with guaranteed execution_metadata
-    if (error instanceof Error) {
-      sendSimulateError(res, 500, 'SIMULATION_ERROR', error.message, 'execution', {
+    if (error instanceof OrchestrationError) {
+      const statusCode = error.code === 'RUVECTOR_REJECTED' ? 403
+        : error.code === 'RUVECTOR_UNAVAILABLE' ? 503
+        : 500;
+      sendSimulateError(res, statusCode, error.code, error.message, 'orchestration', {
+        details: error.details,
+      });
+    } else if (error instanceof Error) {
+      sendSimulateError(res, 500, 'ORCHESTRATION_ERROR', error.message, 'orchestration', {
         name: error.name,
         stack: error.stack,
       });
     } else {
-      // Handle non-Error thrown values (objects, strings, etc.)
       const errorStr = typeof error === 'string'
         ? error
         : JSON.stringify(error, null, 2);
-      sendSimulateError(res, 500, 'UNKNOWN_ERROR', `Non-Error thrown: ${errorStr}`, 'execution', {
+      sendSimulateError(res, 500, 'UNKNOWN_ERROR', `Non-Error thrown: ${errorStr}`, 'orchestration', {
         rawError: error,
       });
     }
@@ -667,49 +641,32 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 // REQUEST ROUTER
 // ============================================================================
 
-/**
- * Sends a generic error response for non-simulate endpoints.
- * These endpoints do NOT require execution_metadata.
- */
 function sendGenericError(res: ServerResponse, statusCode: number, code: string, message: string): void {
   _sendJsonInternal(res, statusCode, {
     error: { code, message },
   });
 }
 
-/**
- * Checks if a path is related to the simulate endpoint.
- * Used to determine whether to include execution_metadata in error responses.
- */
 function isSimulatePath(path: string): boolean {
   return path.startsWith('/v1/simulate') || path === '/simulate';
 }
 
-/**
- * Main request handler
- *
- * CRITICAL: All errors for simulate-related paths MUST include execution_metadata.
- * This router ensures proper error handling based on the requested path.
- */
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
 
   console.log(`${new Date().toISOString()} ${req.method} ${path}`);
 
-  // CORS headers for authenticated requests
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  // Handle preflight - CORS preflight does not need execution_metadata
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
     return;
   }
 
-  // Route requests
   try {
     switch (path) {
       case '/':
@@ -723,7 +680,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         break;
 
       default:
-        // For simulate-related paths, include execution_metadata in 404
         if (isSimulatePath(path)) {
           sendSimulateError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`, 'routing');
         } else {
@@ -732,7 +688,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
   } catch (error) {
     console.error('Unhandled error:', error);
-    // For simulate-related paths, include execution_metadata in error
     if (isSimulatePath(path)) {
       sendSimulateError(res, 500, 'INTERNAL_ERROR', 'Internal server error', 'routing');
     } else {
@@ -751,20 +706,18 @@ const server = createServer((req, res) => {
   handleRequest(req, res).catch((error) => {
     console.error('Request handler error:', error);
     if (!res.headersSent) {
-      // Use simulate error for any unhandled errors to be safe
-      // This ensures CLI contract compliance even for edge cases
       sendSimulateError(res, 500, 'INTERNAL_ERROR', 'Internal server error', 'routing');
     }
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Agentics Simulation Engine server listening on port ${PORT}`);
+  console.log(`Agentics Orchestration Engine listening on port ${PORT}`);
+  console.log(`Mode: orchestration-only (conductor, not engine)`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Simulate endpoint: POST http://localhost:${PORT}/v1/simulate`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully...');
   server.close(() => {

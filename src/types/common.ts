@@ -58,6 +58,13 @@ export type ResourceId = Brand<string, 'ResourceId'>;
 /** Correlation identifier for distributed tracing */
 export type CorrelationId = Brand<string, 'CorrelationId'>;
 
+/**
+ * Canonical execution identifier minted by ruvector-service.
+ * This is the ONLY valid execution ID in the system.
+ * agentics-simulation-engine MUST NOT mint this - it comes from ruvector.
+ */
+export type ExecutionId = Brand<string, 'ExecutionId'>;
+
 // ============================================================================
 // TIMESTAMP AND DURATION TYPES
 // ============================================================================
@@ -306,6 +313,15 @@ export function createResourceId(value: string): ResourceId {
  */
 export function createCorrelationId(value: string): CorrelationId {
   return value as CorrelationId;
+}
+
+/**
+ * Creates an ExecutionId from a string.
+ * ONLY ruvector-service should mint these. This factory is for deserializing
+ * ruvector-minted IDs, NOT for generating new ones locally.
+ */
+export function createExecutionId(value: string): ExecutionId {
+  return value as ExecutionId;
 }
 
 /**

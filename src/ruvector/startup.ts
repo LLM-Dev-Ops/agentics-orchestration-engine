@@ -3,7 +3,7 @@
  *
  * Entry point for starting the event-driven execution listener.
  * This script connects to Ruvector and begins listening for
- * plan_approved events to trigger simulation execution.
+ * plan_approved events to trigger orchestration (delegation to downstream cores).
  *
  * Usage:
  *   npm run start:listener
@@ -53,7 +53,7 @@ function startHealthServer(listener: ExecutionListener | null): Server {
       res.writeHead(isHealthy ? 200 : 503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: isHealthy ? 'healthy' : 'starting',
-        service: 'agentics-simulation-engine-listener',
+        service: 'agentics-orchestration-engine-listener',
         timestamp: new Date().toISOString(),
         listener: status ?? { running: false },
       }));
@@ -81,11 +81,11 @@ function startHealthServer(listener: ExecutionListener | null): Server {
  * 1. Creates the simulation resolver
  * 2. Creates the execution listener
  * 3. Connects to Ruvector
- * 4. Begins processing plan_approved events
+ * 4. Begins processing plan_approved events (delegated to downstream cores)
  */
 async function startExecutionListener(): Promise<void> {
   console.log('='.repeat(60));
-  console.log('AGENTICS SIMULATION ENGINE - EXECUTION LISTENER');
+  console.log('AGENTICS ORCHESTRATION ENGINE - EXECUTION LISTENER');
   console.log('='.repeat(60));
   console.log('');
   console.log('Environment:');

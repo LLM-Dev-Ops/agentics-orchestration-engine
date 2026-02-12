@@ -1,19 +1,25 @@
 /**
  * Event-Driven Execution Listener.
  *
- * Subscribes to Ruvector DecisionEvents and triggers REAL simulation
- * execution when an approved plan is detected.
+ * Subscribes to Ruvector DecisionEvents and triggers orchestration
+ * when an approved plan is detected.
  *
- * This is the FINAL EXECUTION WIRING step that bridges plan approval
- * in agentics-deployment-intent to actual simulation execution.
+ * This listener delegates ALL execution to downstream cores via
+ * the OrchestrationEngine. It does NOT execute simulation logic.
  *
  * @module ruvector/execution-listener
  */
 
-import type { SimulationId, ISOTimestamp } from '../types/common.js';
+import type { SimulationId, ExecutionId, ISOTimestamp } from '../types/common.js';
 import type { SimulationConfig, SimulationResult } from '../types/simulation.js';
 import type { Scenario } from '../types/scenario.js';
-import { SimulationEngine, createSimulationEngine } from '../core/engine.js';
+import {
+  OrchestrationEngine,
+  createOrchestrationEngine,
+  OrchestrationError,
+  type OrchestrationConfig,
+  type OrchestrationResult,
+} from '../core/engine.js';
 import type { CoreClientRegistry } from '../integration/cores/core-client.js';
 import { createMockCoreClientRegistry } from '../integration/cores/mock-cores.js';
 import {
@@ -48,22 +54,7 @@ import { isPlanApprovedEvent, isExecutableEvent } from './types.js';
  * Interface for resolving simulation configurations and scenarios.
  */
 export interface SimulationResolver {
-  /**
-   * Resolves simulation configuration by ID.
-   *
-   * @param simulationId - Simulation identifier
-   * @returns Simulation configuration
-   * @throws Error if simulation not found
-   */
   resolveConfig(simulationId: SimulationId): Promise<SimulationConfig>;
-
-  /**
-   * Resolves scenario for a simulation.
-   *
-   * @param simulationId - Simulation identifier
-   * @returns Scenario to execute
-   * @throws Error if scenario not found
-   */
   resolveScenario(simulationId: SimulationId): Promise<Scenario>;
 }
 
@@ -71,25 +62,14 @@ export interface SimulationResolver {
 // EXECUTION LISTENER CONFIGURATION
 // ============================================================================
 
-/**
- * Configuration for the execution listener.
- */
 export interface ExecutionListenerConfig {
-  /** Ruvector client configuration */
   readonly ruvector: RuvectorClientConfig;
-  /** Idempotency guard configuration */
   readonly idempotency?: Partial<IdempotencyGuardConfig>;
-  /** Engine identifier for lifecycle events */
   readonly engineId: string;
-  /** Whether to execute asynchronously (non-blocking) */
   readonly asyncExecution: boolean;
-  /** Maximum concurrent executions */
   readonly maxConcurrentExecutions: number;
 }
 
-/**
- * Listener status and statistics.
- */
 export interface ExecutionListenerStatus {
   readonly running: boolean;
   readonly startedAt?: ISOTimestamp;
@@ -101,22 +81,17 @@ export interface ExecutionListenerStatus {
   readonly currentExecutions: number;
 }
 
-/**
- * Execution event for internal tracking.
- */
 export interface ExecutionEvent {
   readonly type: 'started' | 'completed' | 'failed' | 'skipped';
   readonly planId: PlanId;
   readonly simulationId: SimulationId;
+  readonly executionId?: ExecutionId;
   readonly timestamp: ISOTimestamp;
   readonly result?: SimulationResult;
   readonly error?: { code: string; message: string };
   readonly reason?: string;
 }
 
-/**
- * Listener for execution events.
- */
 export type ExecutionEventListener = (event: ExecutionEvent) => void;
 
 // ============================================================================
@@ -126,14 +101,14 @@ export type ExecutionEventListener = (event: ExecutionEvent) => void;
 /**
  * Event-driven execution listener.
  *
- * Subscribes to Ruvector DecisionEvents and triggers simulation
- * execution when an approved plan is detected.
+ * Subscribes to Ruvector DecisionEvents and delegates execution
+ * to downstream cores via the OrchestrationEngine.
  *
  * Key behaviors:
  * - Filters for plan_approved events only
  * - Validates events have required plan_id and simulation_id
  * - Enforces idempotency (no duplicate executions)
- * - Triggers REAL simulation execution (advisory=false)
+ * - Delegates ALL execution via OrchestrationEngine (no internal logic)
  * - Emits lifecycle events back to Ruvector
  */
 export class ExecutionListener {
@@ -169,13 +144,6 @@ export class ExecutionListener {
     this.idempotencyGuard = createIdempotencyGuard(config.idempotency);
   }
 
-  /**
-   * Starts the execution listener.
-   *
-   * Connects to Ruvector and begins subscribing to decision events.
-   *
-   * @throws RuvectorClientError if connection fails
-   */
   async start(): Promise<void> {
     if (this.status.running) {
       console.log('[ExecutionListener] Already running');
@@ -184,10 +152,8 @@ export class ExecutionListener {
 
     console.log('[ExecutionListener] Starting execution listener...');
 
-    // Connect to Ruvector
     await this.ruvectorClient.connect();
 
-    // Subscribe to decision events
     this.unsubscribeFromRuvector = this.ruvectorClient.onDecisionEvent(
       (event) => this.handleDecisionEvent(event)
     );
@@ -201,9 +167,6 @@ export class ExecutionListener {
     console.log('[ExecutionListener] Started successfully');
   }
 
-  /**
-   * Stops the execution listener.
-   */
   async stop(): Promise<void> {
     if (!this.status.running) {
       console.log('[ExecutionListener] Not running');
@@ -212,13 +175,11 @@ export class ExecutionListener {
 
     console.log('[ExecutionListener] Stopping execution listener...');
 
-    // Unsubscribe from Ruvector events
     if (this.unsubscribeFromRuvector) {
       this.unsubscribeFromRuvector();
       this.unsubscribeFromRuvector = undefined;
     }
 
-    // Disconnect from Ruvector
     await this.ruvectorClient.disconnect();
 
     this.status = { ...this.status, running: false };
@@ -226,12 +187,6 @@ export class ExecutionListener {
     console.log('[ExecutionListener] Stopped');
   }
 
-  /**
-   * Subscribes to execution events.
-   *
-   * @param listener - Event listener
-   * @returns Unsubscribe function
-   */
   onExecutionEvent(listener: ExecutionEventListener): () => void {
     this.eventListeners.add(listener);
     return () => {
@@ -239,16 +194,10 @@ export class ExecutionListener {
     };
   }
 
-  /**
-   * Gets the current listener status.
-   */
   getStatus(): ExecutionListenerStatus {
     return { ...this.status };
   }
 
-  /**
-   * Gets the idempotency guard statistics.
-   */
   getIdempotencyStatistics() {
     return this.idempotencyGuard.getStatistics();
   }
@@ -257,13 +206,9 @@ export class ExecutionListener {
   // EVENT HANDLING
   // ==========================================================================
 
-  /**
-   * Handles incoming decision events from Ruvector.
-   */
   private async handleDecisionEvent(event: DecisionEvent): Promise<void> {
     this.status = { ...this.status, eventsReceived: this.status.eventsReceived + 1 };
 
-    // Extract payload from event - Ruvector sends data in payload wrapper
     const { type, payload } = event as DecisionEvent & {
       payload?: {
         plan_id?: PlanId;
@@ -281,13 +226,11 @@ export class ExecutionListener {
       advisory,
     });
 
-    // Filter: Only process plan_approved events
     if (type !== 'plan_approved') {
       console.log(`[ExecutionListener] Ignoring event type: ${type}`);
       return;
     }
 
-    // Defensive guard: Check for required fields in payload
     if (!plan_id || !simulation_id) {
       console.warn('[ExecutionListener] Missing required fields in payload', {
         has_plan_id: !!plan_id,
@@ -297,7 +240,6 @@ export class ExecutionListener {
       return;
     }
 
-    // Ignore advisory approvals - only execute real approvals
     if (advisory === true) {
       console.log('[ExecutionListener] Ignoring advisory approval', {
         plan_id,
@@ -306,7 +248,6 @@ export class ExecutionListener {
       return;
     }
 
-    // Construct normalized event with payload fields at top level for downstream processing
     const normalizedEvent: PlanApprovedEvent = {
       ...event,
       type: 'plan_approved',
@@ -315,7 +256,6 @@ export class ExecutionListener {
       execution_profile: execution_profile ?? { tier: 'tier1', mode: 'execute' },
     } as PlanApprovedEvent;
 
-    // Validate: Ensure event has all required fields
     if (!this.validateEvent(normalizedEvent)) {
       console.log('[ExecutionListener] Event validation failed, skipping');
       this.emitExecutionEvent({
@@ -329,7 +269,6 @@ export class ExecutionListener {
       return;
     }
 
-    // Idempotency check: Prevent duplicate execution
     const idempotencyCheck = this.idempotencyGuard.check(plan_id);
     if (!idempotencyCheck.shouldExecute) {
       console.log('[ExecutionListener] Idempotency check failed:', idempotencyCheck.reason);
@@ -344,30 +283,20 @@ export class ExecutionListener {
       return;
     }
 
-    // Concurrency check
     if (this.status.currentExecutions >= this.config.maxConcurrentExecutions) {
       console.log('[ExecutionListener] Max concurrent executions reached, queueing');
-      // In a full implementation, this would queue the execution
-      // For now, we'll execute anyway to not lose events
     }
 
-    // Execute simulation
     if (this.config.asyncExecution) {
-      // Fire and forget - don't block on execution
-      this.executeSimulation(normalizedEvent).catch((error) => {
-        console.error('[ExecutionListener] Async execution error:', error);
+      this.executeOrchestration(normalizedEvent).catch((error) => {
+        console.error('[ExecutionListener] Async orchestration error:', error);
       });
     } else {
-      // Synchronous execution
-      await this.executeSimulation(normalizedEvent);
+      await this.executeOrchestration(normalizedEvent);
     }
   }
 
-  /**
-   * Validates that an event has all required fields for execution.
-   */
   private validateEvent(event: PlanApprovedEvent): boolean {
-    // Validate required fields
     if (!event.plan_id || !event.simulation_id) {
       console.log('[ExecutionListener] Event is not executable:', {
         has_plan_id: !!event.plan_id,
@@ -377,7 +306,6 @@ export class ExecutionListener {
       return false;
     }
 
-    // Validate execution profile
     const profile = event.execution_profile;
     if (!profile || !profile.tier || !profile.mode) {
       console.log('[ExecutionListener] Invalid execution profile');
@@ -388,27 +316,25 @@ export class ExecutionListener {
   }
 
   // ==========================================================================
-  // SIMULATION EXECUTION
+  // ORCHESTRATION (replaces internal simulation execution)
   // ==========================================================================
 
   /**
-   * Executes a simulation based on an approved plan event.
-   *
-   * This is the REAL execution path - advisory mode is DISABLED.
+   * Orchestrates execution by delegating to downstream cores.
+   * This is pure delegation — no internal simulation logic.
+   * The OrchestrationEngine handles ruvector acceptance and core delegation.
    */
-  private async executeSimulation(event: PlanApprovedEvent): Promise<void> {
+  private async executeOrchestration(event: PlanApprovedEvent): Promise<void> {
     const { plan_id, simulation_id, execution_profile } = event;
     const startTime = Date.now();
 
-    console.log('[ExecutionListener] === STARTING SIMULATION EXECUTION ===', {
+    console.log('[ExecutionListener] === STARTING ORCHESTRATION ===', {
       plan_id,
       simulation_id,
       tier: execution_profile.tier,
       mode: execution_profile.mode,
-      advisory: false, // MUST be false for real execution
     });
 
-    // Mark execution as started (idempotency)
     this.idempotencyGuard.markStarted(plan_id);
     this.status = {
       ...this.status,
@@ -419,7 +345,6 @@ export class ExecutionListener {
     // Emit started event to Ruvector
     await this.emitLifecycleStarted(plan_id, simulation_id, execution_profile);
 
-    // Emit internal started event
     this.emitExecutionEvent({
       type: 'started',
       planId: plan_id,
@@ -428,20 +353,23 @@ export class ExecutionListener {
     });
 
     try {
-      // Resolve simulation configuration and scenario
       const config = await this.simulationResolver.resolveConfig(simulation_id);
       const scenario = await this.simulationResolver.resolveScenario(simulation_id);
 
-      // Create and initialize the simulation engine with Core clients
-      const engine = createSimulationEngine();
-      await engine.initialize(config, this.coreClients);
+      // Create orchestration engine — delegates everything to downstream cores
+      const engine = createOrchestrationEngine();
+      engine.initialize(this.ruvectorClient, this.coreClients);
 
-      // Execute the simulation
-      // This is the SAME PATH used for real execution
-      // Advisory mode is DISABLED
-      const result = await engine.execute(scenario);
+      const orchestrationConfig: OrchestrationConfig = {
+        simulationId: simulation_id,
+        simulationConfig: config,
+        scenario,
+        engineId: this.config.engineId,
+      };
 
-      // Mark execution as completed (idempotency)
+      // Orchestrate — blocks until ruvector acceptance, delegates all work
+      const orchestrationResult = await engine.orchestrate(orchestrationConfig);
+
       this.idempotencyGuard.markCompleted(plan_id);
       this.status = {
         ...this.status,
@@ -451,32 +379,36 @@ export class ExecutionListener {
 
       const durationMs = Date.now() - startTime;
 
-      console.log('[ExecutionListener] === SIMULATION EXECUTION COMPLETED ===', {
+      console.log('[ExecutionListener] === ORCHESTRATION COMPLETED ===', {
         plan_id,
         simulation_id,
-        status: result.status,
+        execution_id: orchestrationResult.executionId,
+        status: orchestrationResult.result.status,
+        delegations: orchestrationResult.executionGraph.length,
         duration_ms: durationMs,
       });
 
-      // Emit completed event to Ruvector
-      await this.emitLifecycleCompleted(plan_id, simulation_id, result, durationMs);
+      await this.emitLifecycleCompleted(plan_id, simulation_id, orchestrationResult.result, durationMs);
 
-      // Emit internal completed event
       this.emitExecutionEvent({
         type: 'completed',
         planId: plan_id,
         simulationId: simulation_id,
+        executionId: orchestrationResult.executionId,
         timestamp: new Date().toISOString() as ISOTimestamp,
-        result,
+        result: orchestrationResult.result,
       });
     } catch (error) {
       const durationMs = Date.now() - startTime;
       const errorInfo = {
-        code: error instanceof Error && 'code' in error ? (error as any).code : 'EXECUTION_ERROR',
+        code: error instanceof OrchestrationError
+          ? error.code
+          : error instanceof Error && 'code' in error
+            ? (error as any).code
+            : 'ORCHESTRATION_ERROR',
         message: error instanceof Error ? error.message : String(error),
       };
 
-      // Mark execution as failed (idempotency)
       this.idempotencyGuard.markFailed(plan_id, errorInfo);
       this.status = {
         ...this.status,
@@ -484,17 +416,15 @@ export class ExecutionListener {
         currentExecutions: this.status.currentExecutions - 1,
       };
 
-      console.error('[ExecutionListener] === SIMULATION EXECUTION FAILED ===', {
+      console.error('[ExecutionListener] === ORCHESTRATION FAILED ===', {
         plan_id,
         simulation_id,
         error: errorInfo,
         duration_ms: durationMs,
       });
 
-      // Emit failed event to Ruvector
       await this.emitLifecycleFailed(plan_id, simulation_id, errorInfo, durationMs, error);
 
-      // Emit internal failed event
       this.emitExecutionEvent({
         type: 'failed',
         planId: plan_id,
@@ -509,9 +439,6 @@ export class ExecutionListener {
   // LIFECYCLE EVENT EMISSION
   // ==========================================================================
 
-  /**
-   * Emits simulation_execution_started event to Ruvector.
-   */
   private async emitLifecycleStarted(
     planId: PlanId,
     simulationId: SimulationId,
@@ -524,20 +451,16 @@ export class ExecutionListener {
       timestamp: new Date().toISOString() as ISOTimestamp,
       source: this.config.engineId,
       execution_profile: executionProfile,
-      advisory: false, // MUST be false - this is REAL execution
+      advisory: false,
     };
 
     try {
       await this.ruvectorClient.emitLifecycleEvent(event);
     } catch (error) {
       console.error('[ExecutionListener] Failed to emit started event:', error);
-      // Don't throw - execution should continue even if event emission fails
     }
   }
 
-  /**
-   * Emits simulation_execution_completed event to Ruvector.
-   */
   private async emitLifecycleCompleted(
     planId: PlanId,
     simulationId: SimulationId,
@@ -568,9 +491,6 @@ export class ExecutionListener {
     }
   }
 
-  /**
-   * Emits simulation_execution_failed event to Ruvector.
-   */
   private async emitLifecycleFailed(
     planId: PlanId,
     simulationId: SimulationId,
@@ -598,9 +518,6 @@ export class ExecutionListener {
     }
   }
 
-  /**
-   * Emits internal execution event to listeners.
-   */
   private emitExecutionEvent(event: ExecutionEvent): void {
     for (const listener of this.eventListeners) {
       try {
@@ -616,9 +533,6 @@ export class ExecutionListener {
 // FACTORY FUNCTIONS
 // ============================================================================
 
-/**
- * Creates an execution listener with the given configuration.
- */
 export function createExecutionListener(
   config: ExecutionListenerConfig,
   simulationResolver: SimulationResolver,
@@ -627,9 +541,6 @@ export function createExecutionListener(
   return new ExecutionListener(config, simulationResolver, secretManager);
 }
 
-/**
- * Creates an execution listener from environment variables.
- */
 export function createExecutionListenerFromEnvironment(
   simulationResolver: SimulationResolver,
   secretManager?: SecretManager
@@ -638,7 +549,7 @@ export function createExecutionListenerFromEnvironment(
 
   const config: ExecutionListenerConfig = {
     ruvector: ruvectorConfig,
-    engineId: process.env['ENGINE_ID'] ?? `simulation-engine-${Date.now()}`,
+    engineId: process.env['ENGINE_ID'] ?? `orchestration-engine-${Date.now()}`,
     asyncExecution: process.env['ASYNC_EXECUTION'] !== 'false',
     maxConcurrentExecutions: parseInt(process.env['MAX_CONCURRENT_EXECUTIONS'] ?? '5', 10),
   };
@@ -650,24 +561,14 @@ export function createExecutionListenerFromEnvironment(
 // SIMPLE IN-MEMORY SIMULATION RESOLVER (FOR TESTING)
 // ============================================================================
 
-/**
- * Simple in-memory simulation resolver.
- * In production, this would load from a database or external service.
- */
 export class InMemorySimulationResolver implements SimulationResolver {
   private readonly configs: Map<SimulationId, SimulationConfig> = new Map();
   private readonly scenarios: Map<SimulationId, Scenario> = new Map();
 
-  /**
-   * Registers a simulation configuration.
-   */
   registerConfig(simulationId: SimulationId, config: SimulationConfig): void {
     this.configs.set(simulationId, config);
   }
 
-  /**
-   * Registers a scenario for a simulation.
-   */
   registerScenario(simulationId: SimulationId, scenario: Scenario): void {
     this.scenarios.set(simulationId, scenario);
   }
@@ -689,9 +590,6 @@ export class InMemorySimulationResolver implements SimulationResolver {
   }
 }
 
-/**
- * Creates an in-memory simulation resolver.
- */
 export function createInMemorySimulationResolver(): InMemorySimulationResolver {
   return new InMemorySimulationResolver();
 }

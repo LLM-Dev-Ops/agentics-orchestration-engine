@@ -7,7 +7,7 @@
  * @module ruvector/types
  */
 
-import type { SimulationId, ISOTimestamp } from '../types/common.js';
+import type { SimulationId, ExecutionId, ISOTimestamp, SpanId, TraceId } from '../types/common.js';
 
 // ============================================================================
 // BRANDED TYPES
@@ -307,4 +307,52 @@ export interface RuvectorConnectionStatus {
   readonly eventsReceived: number;
   readonly eventsProcessed: number;
   readonly errors: number;
+}
+
+// ============================================================================
+// EXECUTION ACCEPTANCE PROTOCOL
+// ============================================================================
+
+/**
+ * Request to ruvector-service for execution acceptance.
+ * The engine sends this to request permission to execute.
+ * Ruvector mints the canonical execution_id if accepted.
+ */
+export interface ExecutionAcceptanceRequest {
+  /** The scenario being submitted for execution */
+  readonly simulation_id: SimulationId;
+  /** Plan that triggered this execution (if event-driven) */
+  readonly plan_id?: PlanId;
+  /** Requesting engine identifier */
+  readonly source: string;
+  /** Request timestamp */
+  readonly timestamp: ISOTimestamp;
+  /** Scenario metadata for ruvector to evaluate */
+  readonly scenario_metadata: {
+    readonly scenario_id: string;
+    readonly name: string;
+    readonly category: string;
+    readonly step_count: number;
+  };
+}
+
+/**
+ * Response from ruvector-service for execution acceptance.
+ * Contains the canonical execution_id minted by ruvector.
+ */
+export interface ExecutionAcceptanceResponse {
+  /** Whether the execution was accepted */
+  readonly accepted: boolean;
+  /** Ruvector-minted canonical execution ID (only present if accepted) */
+  readonly execution_id?: ExecutionId;
+  /** Root span ID for this execution (only present if accepted) */
+  readonly root_span_id?: SpanId;
+  /** Trace ID for distributed tracing (only present if accepted) */
+  readonly trace_id?: TraceId;
+  /** Rejection reason (only present if rejected) */
+  readonly rejection_reason?: string;
+  /** Rejection code (only present if rejected) */
+  readonly rejection_code?: string;
+  /** Timestamp of the response */
+  readonly timestamp: ISOTimestamp;
 }

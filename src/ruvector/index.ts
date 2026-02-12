@@ -40,6 +40,9 @@ export type {
   // Configuration types
   RuvectorClientConfig,
   RuvectorConnectionStatus,
+  // Execution acceptance protocol
+  ExecutionAcceptanceRequest,
+  ExecutionAcceptanceResponse,
 } from './types.js';
 
 // Type guards and factory functions

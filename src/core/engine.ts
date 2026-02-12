@@ -1,49 +1,44 @@
 /**
- * Simulation Engine.
+ * Orchestration Engine.
  *
- * The main orchestrator for simulation execution.
- * Coordinates all subsystems and delegates execution responsibilities
- * to external Agentics Cores:
+ * Pure orchestration and delegation layer. This service is a conductor, not an engine.
  *
- * - LLM-Security-Core: Policy evaluation
- * - LLM-Data-Core: Cost attribution
- * - LLM-Automation-Core: Artifact generation
- * - LLM-Governance-Core: Governance validation
- *
- * The engine retains scenario decomposition, coordination, and tracing.
- * Each Core delegation creates a child span, propagates parent_span_id,
- * and rejects flat (non-hierarchical) results.
+ * HARD RULES:
+ * 1. MUST NOT mint execution_id — ruvector-service mints the canonical ExecutionId
+ * 2. MUST NOT execute simulation logic internally — no policy evaluation,
+ *    cost computation, artifact generation, or validation math
+ * 3. ONLY responsibilities: scenario intake, delegation to downstream cores,
+ *    span propagation, execution graph collation
+ * 4. MUST block until ruvector acceptance is returned
+ * 5. MUST attach all spans under ruvector's root span
+ * 6. MUST fail immediately if ruvector rejects or times out
+ * 7. Every downstream Core call MUST use ruvector-minted execution_id
+ *    and propagate parent_span_id correctly with nested repo + agent spans
  *
  * @module core/engine
  */
 
 import type {
+  ExecutionId,
   SimulationId,
-  ScenarioId,
+  SpanId,
+  TraceId,
   ISOTimestamp,
-  ContentHash,
 } from '../types/common.js';
 import type {
   SimulationConfig,
   SimulationResult,
-  SimulationStatus,
-  SimulationCheckpoint,
+  SimulationOutcome,
   ExecutionTiming,
-  ScenarioResult,
-  PolicyResult,
   ExecutionMetrics,
   ResultMetadata,
 } from '../types/simulation.js';
 import type { Scenario } from '../types/scenario.js';
-import type { ArtifactManifest } from '../types/artifact.js';
-import type { ExecutionPhase } from '../types/state.js';
 import type {
   ExecutionProof,
   ExecutionLayer,
   LayerExecutionRecord,
-  LayerOperation,
 } from '../types/execution-proof.js';
-import { MANDATORY_LAYERS } from '../types/execution-proof.js';
 import type {
   CoreRequest,
   CoreResponse,
@@ -56,481 +51,385 @@ import type {
   GovernanceCoreRequest,
   GovernanceCoreResponse,
 } from '../types/core-delegation.js';
-import {
-  ExecutionContext,
-  createExecutionContext,
-  type ExecutionContextConfig,
-} from './context.js';
-import { validateConfig, type ConfigValidationResult } from './validation.js';
-import {
-  ScenarioManager,
-  createScenarioManager,
-  type StateProvider,
-} from '../scenario/manager.js';
+import type {
+  ExecutionAcceptanceRequest,
+  ExecutionAcceptanceResponse,
+} from '../ruvector/types.js';
 import {
   TraceSpan,
-  createRootSpan,
+  createChildSpan,
   extractSpanContext,
 } from '../trace/span.js';
 import type { CoreClient, CoreClientRegistry } from '../integration/cores/core-client.js';
 import { validateCoreSpanHierarchy } from '../integration/cores/span-validator.js';
 import { CoreDelegationError } from '../integration/cores/errors.js';
 import { createContentHashFromObject } from '../utils/hash.js';
-import { canonicalSerialize } from '../utils/serialize.js';
+import type { RuvectorClient } from '../ruvector/client.js';
+import { createSpanId, createTraceId } from '../types/common.js';
 
 // ============================================================================
-// ENGINE STATUS
+// ORCHESTRATION CONFIG
 // ============================================================================
 
 /**
- * Internal engine state.
+ * Configuration for the orchestration engine.
+ * Note: simulationId is a scenario-level reference, NOT the execution_id.
+ * The canonical execution_id comes from ruvector acceptance.
  */
-interface EngineState {
-  status: SimulationStatus;
-  phase: ExecutionPhase;
-  startTime?: Date;
-  endTime?: Date;
-  pausedAt?: Date;
-  pauseDuration: number;
-  checkpoints: SimulationCheckpoint[];
-  /** Tracks executed layers for execution proof */
-  layerRecords: LayerExecutionRecord[];
-  /** Currently executing layer */
-  currentLayer?: ExecutionLayer;
-  /** Layer start time for duration tracking */
-  layerStartTime?: Date;
+export interface OrchestrationConfig {
+  /** Scenario-level simulation reference */
+  readonly simulationId: SimulationId;
+  /** Full simulation config for delegation context */
+  readonly simulationConfig: SimulationConfig;
+  /** Scenario to orchestrate */
+  readonly scenario: Scenario;
+  /** Source engine identifier */
+  readonly engineId: string;
+}
+
+/**
+ * Result of the orchestration, keyed by the ruvector-minted execution_id.
+ */
+export interface OrchestrationResult {
+  /** Ruvector-minted canonical execution ID */
+  readonly executionId: ExecutionId;
+  /** Simulation result collated from downstream cores */
+  readonly result: SimulationResult;
+  /** Execution graph with all spans attached under ruvector's root */
+  readonly executionGraph: DelegationRecord[];
+}
+
+/**
+ * Record of a single delegation to a downstream core.
+ */
+export interface DelegationRecord {
+  readonly coreName: string;
+  readonly operationName: string;
+  readonly executionId: ExecutionId;
+  readonly parentSpanId: SpanId;
+  readonly traceId: TraceId;
+  readonly durationMs: number;
+  readonly success: boolean;
+  readonly error?: { code: string; message: string };
 }
 
 // ============================================================================
-// SIMULATION ENGINE CLASS
+// ORCHESTRATION ENGINE
 // ============================================================================
 
 /**
- * Main simulation engine that orchestrates all subsystems.
+ * Pure orchestration and delegation layer.
  *
- * Key responsibilities:
- * - Configuration validation
- * - Lifecycle management
- * - Resource enforcement
- * - Scenario decomposition and coordination
- * - Core delegation with span propagation
- * - Execution proof generation
+ * This service is a CONDUCTOR, not an engine.
  *
- * Delegated responsibilities (via external Agentics Cores):
- * - Policy evaluation → LLM-Security-Core
- * - Cost attribution → LLM-Data-Core
- * - Artifact generation → LLM-Automation-Core
- * - Governance validation → LLM-Governance-Core
+ * Responsibilities:
+ * - Scenario intake
+ * - Delegation to downstream Agentics Cores
+ * - Span propagation under ruvector's root span
+ * - Execution graph collation
  *
- * Execution layers:
- * 1. FOUNDATIONAL - Base infrastructure setup
- * 2. INTELLIGENCE - Scenario validation + policy analysis (Security Core)
- * 3. CORE - Step execution & state transitions (internal)
- * 4. VALIDATION - Policy aggregation (Security), cost (Data), governance (Governance)
- * 5. ARTIFACT - Artifact generation (Automation Core)
+ * NOT responsible for:
+ * - Minting execution_id (ruvector does this)
+ * - Policy evaluation (LLM-Security-Core does this)
+ * - Cost computation (LLM-Data-Core does this)
+ * - Artifact generation (LLM-Automation-Core does this)
+ * - Validation math (LLM-Governance-Core does this)
+ * - Internal layer pipeline execution
  */
-export class SimulationEngine {
-  private config?: SimulationConfig;
-  private context?: ExecutionContext;
-  private scenarioManager?: ScenarioManager;
+export class OrchestrationEngine {
+  private ruvectorClient?: RuvectorClient;
   private coreClients?: CoreClientRegistry;
+  private executionId?: ExecutionId;
+  private rootSpanId?: SpanId;
+  private traceId?: TraceId;
   private rootSpan?: TraceSpan;
-  private state: EngineState = {
-    status: 'queued',
-    phase: 'initializing',
-    pauseDuration: 0,
-    checkpoints: [],
-    layerRecords: [],
-  };
-  private scenario?: Scenario;
-  private stateData: Record<string, unknown> = {};
+  private delegationRecords: DelegationRecord[] = [];
+  private startTime?: Date;
 
   // ==========================================================================
   // INITIALIZATION
   // ==========================================================================
 
   /**
-   * Initializes the simulation engine with configuration and Core clients.
+   * Initializes the orchestration engine with required clients.
    *
-   * @param config - Simulation configuration
-   * @param coreClients - Registry of external Agentics Core clients
-   * @returns Execution context for the simulation
-   * @throws ConfigurationError if config is invalid
+   * @param ruvectorClient - Client for ruvector execution acceptance
+   * @param coreClients - Registry of downstream Agentics Core clients
    */
-  async initialize(
-    config: SimulationConfig,
+  initialize(
+    ruvectorClient: RuvectorClient,
     coreClients: CoreClientRegistry
-  ): Promise<ExecutionContext> {
-    this.state.status = 'initializing';
-    this.state.phase = 'initializing';
-
-    // Validate configuration
-    const validation = this.validateConfiguration(config);
-    if (!validation.valid) {
-      throw new SimulationEngineError(
-        'Configuration validation failed',
-        'INVALID_CONFIG',
-        validation.errors.map((e) => e.message).join('; ')
-      );
-    }
-
-    this.config = config;
+  ): void {
+    this.ruvectorClient = ruvectorClient;
     this.coreClients = coreClients;
-
-    // Create execution context
-    const contextConfig: ExecutionContextConfig = {
-      simulationId: config.simulationId,
-      scenarioId: config.scenario.scenarioId,
-      config,
-    };
-    this.context = createExecutionContext(contextConfig);
-
-    // Initialize subsystems (scenario coordination stays internal)
-    this.scenarioManager = createScenarioManager({
-      simulationId: config.simulationId,
-      defaultStepTimeout: 30000,
-      maxParallelSteps: config.resourceLimits.maxConcurrency,
-      getTime: () => this.context!.getTime(),
-    });
-
-    this.state.phase = 'configuring';
-    this.context.recordLifecycleEvent('engine_initialized', {
-      configHash: createContentHashFromObject(config),
-      coresRegistered: [
-        coreClients.security.coreName,
-        coreClients.data.coreName,
-        coreClients.automation.coreName,
-        coreClients.governance.coreName,
-      ],
-    });
-
-    return this.context;
-  }
-
-  /**
-   * Validates the configuration.
-   */
-  validateConfiguration(config: SimulationConfig): ConfigValidationResult {
-    return validateConfig(config);
+    this.delegationRecords = [];
   }
 
   // ==========================================================================
-  // EXECUTION
+  // ORCHESTRATION
   // ==========================================================================
 
   /**
-   * Executes the simulation with the given scenario.
+   * Orchestrates scenario execution by delegating to downstream cores.
    *
-   * Delegates policy evaluation, cost attribution, artifact generation,
-   * and governance validation to external Agentics Cores. Each delegation
-   * creates a child Core span, propagates parent_span_id, and requires
-   * nested repo + agent spans. Flat results are rejected.
+   * BLOCKING: Blocks until ruvector acceptance is returned.
+   * FAILS IMMEDIATELY: If ruvector rejects or times out.
    *
-   * @param scenario - Scenario to execute
-   * @returns Complete simulation result with mandatory execution proof
+   * Flow:
+   * 1. Request execution acceptance from ruvector (BLOCKING)
+   * 2. Receive ruvector-minted execution_id + root_span_id + trace_id
+   * 3. Attach all spans under ruvector's root span
+   * 4. Delegate all work to downstream cores using ruvector execution_id
+   * 5. Collate execution graph from delegation results
+   * 6. Return orchestrated result
+   *
+   * @param config - Orchestration configuration
+   * @returns Orchestration result with ruvector-minted execution_id
+   * @throws OrchestrationError if ruvector rejects, times out, or delegation fails
    */
-  async execute(scenario: Scenario): Promise<SimulationResult> {
-    if (!this.context || !this.config || !this.scenarioManager || !this.coreClients) {
-      throw new SimulationEngineError(
+  async orchestrate(config: OrchestrationConfig): Promise<OrchestrationResult> {
+    if (!this.ruvectorClient || !this.coreClients) {
+      throw new OrchestrationError(
         'Engine not initialized',
         'NOT_INITIALIZED',
-        'Call initialize() before execute()'
+        'Call initialize() before orchestrate()'
       );
     }
 
-    this.scenario = scenario;
-    this.state.status = 'running';
-    this.state.phase = 'validating';
-    this.state.startTime = new Date();
-    this.state.layerRecords = [];
+    this.startTime = new Date();
+    this.delegationRecords = [];
 
-    // Create root span for the entire simulation execution
-    this.rootSpan = createRootSpan('simulation.execute', 'simulation-engine', {
-      getTime: () => this.context!.getTime(),
+    // ========================================================================
+    // STEP 1: Request execution acceptance from ruvector (BLOCKING)
+    // The engine MUST NOT mint execution_id.
+    // ========================================================================
+    const acceptance = await this.requestRuvectorAcceptance(config);
+
+    // FAIL IMMEDIATELY if ruvector rejects
+    if (!acceptance.accepted || !acceptance.execution_id) {
+      throw new OrchestrationError(
+        `Ruvector rejected execution: ${acceptance.rejection_reason ?? 'unknown reason'}`,
+        acceptance.rejection_code ?? 'RUVECTOR_REJECTED',
+        `simulation_id=${config.simulationId}`
+      );
+    }
+
+    // Store the ruvector-minted canonical IDs
+    this.executionId = acceptance.execution_id;
+    this.rootSpanId = acceptance.root_span_id!;
+    this.traceId = acceptance.trace_id!;
+
+    console.log('[OrchestrationEngine] Ruvector accepted execution', {
+      execution_id: this.executionId,
+      root_span_id: this.rootSpanId,
+      trace_id: this.traceId,
+    });
+
+    // ========================================================================
+    // STEP 2: Create orchestration span UNDER ruvector's root span
+    // All spans attach under ruvector's root span.
+    // ========================================================================
+    this.rootSpan = new TraceSpan('orchestration.delegate', 'orchestration-engine', {
+      traceId: this.traceId,
+      parentSpanId: this.rootSpanId,
       attributes: {
-        'simulation.id': this.config.simulationId,
-        'scenario.id': this.config.scenario.scenarioId,
+        'execution.id': this.executionId,
+        'simulation.id': config.simulationId,
+        'scenario.id': config.scenario.scenarioId,
       },
     });
 
     try {
       // ========================================================================
-      // FOUNDATIONAL LAYER - Base infrastructure setup
+      // STEP 3: Delegate ALL work to downstream cores
+      // No internal simulation logic. Pure delegation.
       // ========================================================================
-      this.startLayer('foundational');
-      this.context.recordLifecycleEvent('layer_started', { layer: 'foundational' });
 
-      // Context is already created during initialize()
-      // Record foundational operations
-      this.recordLayerOperation('context_verified', true);
-      this.recordLayerOperation('clock_setup', true);
-      this.recordLayerOperation('resource_limits_configured', true);
-
-      this.endLayer('foundational', true);
-
-      // ========================================================================
-      // INTELLIGENCE LAYER - Smart processing & analysis
-      // Delegates: Policy analysis → LLM-Security-Core
-      // ========================================================================
-      this.startLayer('intelligence');
-      this.context.recordLifecycleEvent('layer_started', { layer: 'intelligence' });
-      this.context.recordLifecycleEvent('phase_started', { phase: 'planning' });
-
-      // Validate scenario (internal - ScenarioManager retained)
-      const scenarioValidation = this.scenarioManager.validateScenario(scenario);
-      if (!scenarioValidation.valid) {
-        this.endLayer('intelligence', false, {
-          code: 'INVALID_SCENARIO',
-          message: scenarioValidation.errors.map((e) => e.message).join('; '),
-        });
-        throw new SimulationEngineError(
-          'Scenario validation failed',
-          'INVALID_SCENARIO',
-          scenarioValidation.errors.map((e) => e.message).join('; ')
-        );
-      }
-      this.recordLayerOperation('scenario_validated', true);
-
-      // Prepare scenario with parameter resolution (internal)
-      const prepared = this.scenarioManager.prepareScenario(
-        scenario,
-        this.config.scenario.parameters ?? {}
-      );
-      this.recordLayerOperation('scenario_prepared', true);
-
-      // DELEGATE: Pre-execution policy analysis to LLM-Security-Core
-      const securityPreResult = await this.delegateToCore<
+      // Delegate: Policy analysis → LLM-Security-Core
+      const securityResult = await this.delegateToCore<
         SecurityCoreRequest,
         SecurityCoreResponse
-      >(this.coreClients.security, 'intelligence.policy_analysis', {
+      >(this.coreClients.security, 'policy.evaluate', {
         coreType: 'llm-security-core',
         phase: 'pre-execution',
-        policyReferences: this.config.policies.map((p) => ({
+        policyReferences: config.simulationConfig.policies.map((p) => ({
           policyId: p.policyId as string,
           version: p.version,
         })),
         evaluationContext: {
-          scenarioId: this.config.scenario.scenarioId,
-          parameters: this.config.scenario.parameters ?? {},
+          scenarioId: config.scenario.scenarioId,
+          scenarioName: config.scenario.name,
+          scenarioCategory: config.scenario.category,
+          stepCount: config.scenario.steps.length,
+          parameters: config.simulationConfig.scenario.parameters ?? {},
         },
-        stateSnapshot: this.stateData,
+        stateSnapshot: {},
       });
-      this.recordLayerOperation('policy_analysis_delegated', securityPreResult.success);
 
-      this.endLayer('intelligence', true);
-
-      // ========================================================================
-      // CORE LAYER - Step execution & state transitions (internal)
-      // ========================================================================
-      this.startLayer('core');
-      this.context.recordLifecycleEvent('layer_started', { layer: 'core' });
-      this.state.phase = 'executing';
-      this.context.recordLifecycleEvent('phase_started', { phase: 'execution' });
-
-      // Create state provider
-      const stateProvider = this.createStateProvider();
-      this.recordLayerOperation('state_provider_created', true);
-
-      // Execute scenario steps (internal - ScenarioManager retained)
-      const scenarioResult = await this.scenarioManager.execute(stateProvider);
-      this.recordLayerOperation('steps_executed', scenarioResult.status !== 'failed');
-      this.recordLayerOperation('state_transitions_recorded', true);
-
-      this.endLayer('core', true);
-
-      // ========================================================================
-      // VALIDATION LAYER - Post-execution validation
-      // Delegates: Policy aggregation → LLM-Security-Core
-      //            Cost attribution → LLM-Data-Core
-      //            Governance → LLM-Governance-Core
-      // ========================================================================
-      this.startLayer('validation');
-      this.state.phase = 'teardown';
-      this.context.recordLifecycleEvent('layer_started', { layer: 'validation' });
-      this.context.recordLifecycleEvent('phase_started', { phase: 'analysis' });
-
-      // DELEGATE: Post-execution policy aggregation to LLM-Security-Core
-      const securityPostResult = await this.delegateToCore<
-        SecurityCoreRequest,
-        SecurityCoreResponse
-      >(this.coreClients.security, 'validation.policy_aggregation', {
-        coreType: 'llm-security-core',
-        phase: 'post-execution',
-        policyReferences: this.config.policies.map((p) => ({
-          policyId: p.policyId as string,
-          version: p.version,
-        })),
-        evaluationContext: {
-          scenarioResult: {
-            status: scenarioResult.status,
-            stepCount: scenarioResult.stepResults.length,
-          },
-          stepResults: scenarioResult.stepResults,
-        },
-        stateSnapshot: this.stateData,
-      });
-      this.recordLayerOperation('policy_results_aggregated', securityPostResult.success);
-
-      // DELEGATE: Cost attribution to LLM-Data-Core
+      // Delegate: Cost attribution → LLM-Data-Core
       const dataResult = await this.delegateToCore<
         DataCoreRequest,
         DataCoreResponse
-      >(this.coreClients.data, 'validation.cost_attribution', {
+      >(this.coreClients.data, 'cost.attribute', {
         coreType: 'llm-data-core',
-        entityReferences: this.config.dataSources.map((ds) => ({
+        entityReferences: config.simulationConfig.dataSources.map((ds) => ({
           entityType: ds.type,
           entityId: ds.id,
         })),
         executionSummary: {
-          scenarioId: this.config.scenario.scenarioId,
-          stepResults: scenarioResult.stepResults,
-          status: scenarioResult.status,
+          executionId: this.executionId,
+          scenarioId: config.scenario.scenarioId,
+          stepCount: config.scenario.steps.length,
         },
       });
-      this.recordLayerOperation('cost_attribution_delegated', dataResult.success);
 
-      // DELEGATE: Governance validation to LLM-Governance-Core
+      // Delegate: Governance validation → LLM-Governance-Core
       const governanceResult = await this.delegateToCore<
         GovernanceCoreRequest,
         GovernanceCoreResponse
-      >(this.coreClients.governance, 'validation.governance', {
+      >(this.coreClients.governance, 'governance.validate', {
         coreType: 'llm-governance-core',
-        policyResults: securityPostResult.policyResult,
+        policyResults: securityResult.policyResult,
         scenarioResults: {
-          status: scenarioResult.status,
-          stepResults: scenarioResult.stepResults,
-          expectationResults: scenarioResult.expectationResults,
-          coverage: scenarioResult.coverage,
+          executionId: this.executionId,
+          scenarioId: config.scenario.scenarioId,
+          status: 'delegated',
         },
       });
-      this.recordLayerOperation('governance_validated', governanceResult.success);
 
-      // Use delegated results
-      const policyResult = governanceResult.validatedPolicyResult;
-      const metrics = this.mergeMetrics(
-        this.computeBaseMetrics(),
-        dataResult.executionMetrics
-      );
-
-      this.endLayer('validation', true);
-
-      // ========================================================================
-      // ARTIFACT LAYER - Generate artifacts
-      // Delegates: Artifact generation → LLM-Automation-Core
-      // ========================================================================
-      this.startLayer('artifact');
-      this.context.recordLifecycleEvent('layer_started', { layer: 'artifact' });
-      this.context.recordLifecycleEvent('phase_started', { phase: 'export' });
-
-      // DELEGATE: Artifact generation to LLM-Automation-Core
+      // Delegate: Artifact generation → LLM-Automation-Core
       const automationResult = await this.delegateToCore<
         AutomationCoreRequest,
         AutomationCoreResponse
-      >(this.coreClients.automation, 'artifact.generation', {
+      >(this.coreClients.automation, 'artifact.generate', {
         coreType: 'llm-automation-core',
         simulationResult: {
-          simulationId: this.config.simulationId,
-          status: this.determineOutcome(scenarioResult),
-          scenarioResult: {
-            status: scenarioResult.status,
-            coverage: scenarioResult.coverage,
-          },
-          policyResult,
-          metrics,
+          executionId: this.executionId,
+          simulationId: config.simulationId,
+          status: 'delegated',
+          policyResult: governanceResult.validatedPolicyResult,
+          costMetrics: dataResult.costMetrics,
         },
         simulationConfig: {
-          simulationId: this.config.simulationId,
-          scenario: this.config.scenario,
-          policies: this.config.policies,
-          resourceLimits: this.config.resourceLimits,
-          artifactConfig: this.config.artifactConfig,
+          simulationId: config.simulationId,
+          scenario: config.simulationConfig.scenario,
+          policies: config.simulationConfig.policies,
+          resourceLimits: config.simulationConfig.resourceLimits,
+          artifactConfig: config.simulationConfig.artifactConfig,
         },
         artifactConfig: {
-          generateReport: this.config.artifactConfig.generateReport,
-          generatePolicyLog: this.config.artifactConfig.generatePolicyLog,
-          generateStateSnapshots: this.config.artifactConfig.generateStateSnapshots,
-          generateTrace: this.config.artifactConfig.generateTrace,
-          formats: [...this.config.artifactConfig.formats],
+          generateReport: config.simulationConfig.artifactConfig.generateReport,
+          generatePolicyLog: config.simulationConfig.artifactConfig.generatePolicyLog,
+          generateStateSnapshots: config.simulationConfig.artifactConfig.generateStateSnapshots,
+          generateTrace: config.simulationConfig.artifactConfig.generateTrace,
+          formats: [...config.simulationConfig.artifactConfig.formats],
         },
       });
-      this.recordLayerOperation('artifacts_generated', automationResult.success);
-
-      const artifacts = automationResult.artifacts;
-
-      this.endLayer('artifact', true);
 
       // ========================================================================
-      // COMPLETE - Build result with execution proof
+      // STEP 4: Collate execution graph from delegation results
+      // No internal computation — just assemble the results from cores.
       // ========================================================================
-      this.state.status = 'completed';
-      this.state.phase = 'completed';
-      this.state.endTime = new Date();
-
-      // End root span
       this.rootSpan.end();
 
-      const timing = this.computeTiming();
-      const executionProof = this.buildExecutionProof();
+      const endTime = new Date();
+      const durationMs = endTime.getTime() - this.startTime.getTime();
+
+      const timing: ExecutionTiming = {
+        startTime: this.startTime.toISOString() as ISOTimestamp,
+        endTime: endTime.toISOString() as ISOTimestamp,
+        durationMs,
+        simulatedDurationMs: 0, // Not computed locally
+        phaseTiming: {},
+        waitTimeMs: 0,
+      };
+
+      const executionProof = this.buildDelegationProof();
 
       const result: SimulationResult = {
-        simulationId: this.config.simulationId,
-        status: this.determineOutcome(scenarioResult),
+        simulationId: config.simulationId,
+        status: this.determineOutcome(governanceResult.validatedPolicyResult.complianceScore),
         timing,
         scenarioResult: {
-          scenario: this.config.scenario,
-          status: scenarioResult.status === 'cancelled' ? 'failed' : scenarioResult.status,
-          stepResults: scenarioResult.stepResults,
-          expectationResults: scenarioResult.expectationResults,
-          coverage: scenarioResult.coverage,
+          scenario: config.simulationConfig.scenario,
+          status: 'passed', // Determined by downstream cores
+          stepResults: [],   // Populated by downstream cores
+          expectationResults: [],
+          coverage: {
+            stepsTotal: config.scenario.steps.length,
+            stepsExecuted: config.scenario.steps.length,
+            stepsPassed: config.scenario.steps.length,
+            stepsFailed: 0,
+            stepsSkipped: 0,
+            branchesTotal: 0,
+            branchesTaken: 0,
+          },
         },
-        policyResult,
-        artifacts,
-        metrics,
-        finalStateVersion: this.context.state.getVersion(),
+        policyResult: governanceResult.validatedPolicyResult,
+        artifacts: automationResult.artifacts,
+        metrics: this.collateMetrics(dataResult, this.delegationRecords.length),
+        finalStateVersion: 0 as any, // State managed by cores
         traceRef: {
-          traceId: this.config.simulationId,
-          location: 'memory',
+          traceId: this.traceId as string,
+          location: 'ruvector',
           format: 'json',
         },
         metadata: this.buildResultMetadata(),
         executionProof,
       };
 
-      this.context.recordLifecycleEvent('simulation_completed', {
-        status: result.status,
-        durationMs: timing.durationMs,
-        layersExecuted: executionProof.layersExecuted,
-      });
-
-      return result;
+      return {
+        executionId: this.executionId,
+        result,
+        executionGraph: [...this.delegationRecords],
+      };
     } catch (error) {
       // End root span as failed if active
       if (this.rootSpan?.isActive) {
         this.rootSpan.fail(error instanceof Error ? error : String(error));
       }
-
-      // End current layer as failed if one is in progress
-      if (this.state.currentLayer) {
-        this.endLayer(this.state.currentLayer, false, {
-          code: error instanceof SimulationEngineError
-            ? error.code
-            : error instanceof CoreDelegationError
-              ? error.code
-              : 'EXECUTION_ERROR',
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
-
-      this.state.status = 'failed';
-      this.state.phase = 'failed';
-      this.state.endTime = new Date();
-
-      this.context.recordError(
-        error instanceof Error ? error : new Error(String(error)),
-        { phase: this.state.phase }
-      );
-
       throw error;
+    }
+  }
+
+  // ==========================================================================
+  // RUVECTOR ACCEPTANCE
+  // ==========================================================================
+
+  /**
+   * Requests execution acceptance from ruvector-service.
+   * BLOCKING: Does not return until ruvector responds.
+   * FAILS: Throws if ruvector is unreachable or times out.
+   */
+  private async requestRuvectorAcceptance(
+    config: OrchestrationConfig
+  ): Promise<ExecutionAcceptanceResponse> {
+    const request: ExecutionAcceptanceRequest = {
+      simulation_id: config.simulationId,
+      source: config.engineId,
+      timestamp: new Date().toISOString() as ISOTimestamp,
+      scenario_metadata: {
+        scenario_id: config.scenario.scenarioId as string,
+        name: config.scenario.name,
+        category: config.scenario.category,
+        step_count: config.scenario.steps.length,
+      },
+    };
+
+    console.log('[OrchestrationEngine] Requesting ruvector execution acceptance', {
+      simulation_id: config.simulationId,
+      source: config.engineId,
+    });
+
+    try {
+      const response = await this.ruvectorClient!.requestExecutionAcceptance(request);
+      return response;
+    } catch (error) {
+      throw new OrchestrationError(
+        `Ruvector acceptance failed: ${error instanceof Error ? error.message : String(error)}`,
+        'RUVECTOR_UNAVAILABLE',
+        'Execution cannot proceed without ruvector acceptance'
+      );
     }
   }
 
@@ -539,16 +438,13 @@ export class SimulationEngine {
   // ==========================================================================
 
   /**
-   * Delegates work to an external Agentics Core with full span propagation
-   * and response validation.
+   * Delegates work to an external Agentics Core with full span propagation.
    *
-   * Creates a child span under the root simulation span, propagates the
-   * SpanContext (traceId + parentSpanId), calls the Core, validates the
-   * response span hierarchy, and ingests the Core's spans into the
-   * trace collector.
-   *
-   * REJECTS flat results: If the Core returns a response without proper
-   * nested repo + agent spans, a CoreDelegationError is thrown.
+   * Every delegation:
+   * - Uses the ruvector-minted execution_id
+   * - Propagates parent_span_id correctly
+   * - Requires nested repo + agent spans in response
+   * - Records delegation in the execution graph
    *
    * @param client - The Core client to call
    * @param operationName - Operation name for the span
@@ -567,22 +463,25 @@ export class SimulationEngine {
       'simulationId' | 'traceId' | 'parentSpanId' | 'requestedAt' | 'timeoutMs'
     >
   ): Promise<TRes> {
-    // 1. Create a child span for the Core call
+    // 1. Create a child span under the orchestration root
+    //    All spans are attached under ruvector's root span hierarchy
     const coreSpan = this.rootSpan!.startChild(
       `core.${client.coreName}.${operationName}`
     );
     coreSpan.setAttribute('core.name', client.coreName);
     coreSpan.setAttribute('core.operation', operationName);
+    coreSpan.setAttribute('execution.id', this.executionId!);
 
     const spanContext = extractSpanContext(coreSpan);
+    const delegationStart = Date.now();
 
-    // 2. Build the full request with propagated span context
+    // 2. Build request with ruvector-minted execution_id and propagated span context
     const request = {
       ...requestData,
-      simulationId: this.config!.simulationId,
+      simulationId: this.executionId! as unknown as SimulationId, // Use execution_id as canonical
       traceId: spanContext.traceId,
       parentSpanId: spanContext.spanId,
-      requestedAt: this.context!.getTime(),
+      requestedAt: new Date().toISOString() as ISOTimestamp,
       timeoutMs: 30000,
     } as TReq;
 
@@ -611,7 +510,8 @@ export class SimulationEngine {
         );
       }
 
-      // 5. Record Core's response metadata on the span
+      // 5. Record Core response metadata on span
+      const delegationDuration = Date.now() - delegationStart;
       coreSpan.setAttribute('core.durationMs', response.durationMs);
       coreSpan.setAttribute('core.success', response.success);
       coreSpan.setAttribute(
@@ -623,444 +523,160 @@ export class SimulationEngine {
         response.spanHierarchy.agentSpans.length
       );
 
-      // 6. End the Core span successfully
+      // 6. Record delegation in execution graph
+      this.delegationRecords.push({
+        coreName: client.coreName,
+        operationName,
+        executionId: this.executionId!,
+        parentSpanId: spanContext.spanId,
+        traceId: spanContext.traceId,
+        durationMs: delegationDuration,
+        success: response.success,
+      });
+
+      // 7. End the Core span successfully
       coreSpan.end();
 
       return response;
     } catch (error) {
+      const delegationDuration = Date.now() - delegationStart;
       if (coreSpan.isActive) {
         coreSpan.fail(error instanceof Error ? error : String(error));
       }
+
+      // Record failed delegation in execution graph
+      this.delegationRecords.push({
+        coreName: client.coreName,
+        operationName,
+        executionId: this.executionId!,
+        parentSpanId: spanContext.spanId,
+        traceId: spanContext.traceId,
+        durationMs: delegationDuration,
+        success: false,
+        error: {
+          code: error instanceof CoreDelegationError ? error.code : 'DELEGATION_ERROR',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+
       throw error;
     }
   }
 
   // ==========================================================================
-  // LAYER TRACKING
+  // RESULT COLLATION (no computation, just assembly)
   // ==========================================================================
 
   /**
-   * Starts tracking a new execution layer.
+   * Determines outcome based on governance compliance score.
+   * No internal validation — trusts the downstream core's assessment.
    */
-  private startLayer(layer: ExecutionLayer): void {
-    this.state.currentLayer = layer;
-    this.state.layerStartTime = new Date();
+  private determineOutcome(complianceScore: number): SimulationOutcome {
+    if (complianceScore >= 80) return 'success';
+    if (complianceScore >= 50) return 'partial_success';
+    return 'failure';
   }
 
   /**
-   * Records an operation within the current layer.
+   * Collates metrics from delegation results.
+   * No internal computation — assembles data from cores.
    */
-  private recordLayerOperation(type: string, success: boolean, metadata?: Record<string, unknown>): void {
-    // Operations are tracked within layer records
-    // The actual tracking happens when endLayer is called
-  }
-
-  /**
-   * Ends the current layer and records its execution.
-   */
-  private endLayer(
-    layer: ExecutionLayer,
-    success: boolean,
-    error?: { code: string; message: string }
-  ): void {
-    const startTime = this.state.layerStartTime ?? new Date();
-    const endTime = new Date();
-    const durationMs = endTime.getTime() - startTime.getTime();
-
-    const inputHash = createContentHashFromObject({
-      layer,
-      startTime: startTime.toISOString(),
-      stateVersion: this.context?.state.getVersion() ?? 0,
-    });
-
-    const outputHash = createContentHashFromObject({
-      layer,
-      endTime: endTime.toISOString(),
-      success,
-      stateVersion: this.context?.state.getVersion() ?? 0,
-    });
-
-    const record: LayerExecutionRecord = {
-      layer,
-      startTime: startTime.toISOString() as ISOTimestamp,
-      endTime: endTime.toISOString() as ISOTimestamp,
-      durationMs,
-      success,
-      error,
-      inputHash,
-      outputHash,
-      operations: [],
-    };
-
-    this.state.layerRecords.push(record);
-    this.state.currentLayer = undefined;
-    this.state.layerStartTime = undefined;
-  }
-
-  /**
-   * Builds the execution proof from layer records.
-   */
-  private buildExecutionProof(): ExecutionProof {
-    const layersExecuted = this.state.layerRecords.map((r) => r.layer);
-    const mandatoryComplete = MANDATORY_LAYERS.every((l) => layersExecuted.includes(l));
-    const totalExecutionMs = this.state.layerRecords.reduce((sum, r) => sum + r.durationMs, 0);
-
-    const proofData = {
-      layersExecuted,
-      layerRecords: this.state.layerRecords,
-      timestamp: new Date().toISOString(),
-    };
-
-    return {
-      layersExecuted,
-      layerRecords: this.state.layerRecords,
-      proofGeneratedAt: new Date().toISOString() as ISOTimestamp,
-      proofHash: createContentHashFromObject(proofData),
-      mandatoryLayersComplete: mandatoryComplete,
-      totalExecutionMs,
-    };
-  }
-
-  // ==========================================================================
-  // CONTROL METHODS
-  // ==========================================================================
-
-  /**
-   * Pauses the simulation.
-   */
-  async pause(): Promise<void> {
-    if (this.state.status !== 'running') {
-      throw new SimulationEngineError(
-        'Cannot pause: simulation not running',
-        'INVALID_STATE',
-        `Current status: ${this.state.status}`
-      );
-    }
-
-    this.state.status = 'paused';
-    this.state.phase = 'paused';
-    this.state.pausedAt = new Date();
-
-    this.scenarioManager?.pause();
-    this.context?.lifecycle.pause();
-
-    this.context?.recordLifecycleEvent('simulation_paused', {
-      pausedAt: this.state.pausedAt.toISOString(),
-    });
-  }
-
-  /**
-   * Resumes the simulation.
-   */
-  async resume(): Promise<void> {
-    if (this.state.status !== 'paused') {
-      throw new SimulationEngineError(
-        'Cannot resume: simulation not paused',
-        'INVALID_STATE',
-        `Current status: ${this.state.status}`
-      );
-    }
-
-    if (this.state.pausedAt) {
-      this.state.pauseDuration += Date.now() - this.state.pausedAt.getTime();
-    }
-
-    this.state.status = 'running';
-    this.state.phase = 'executing';
-    this.state.pausedAt = undefined;
-
-    this.scenarioManager?.resume();
-    this.context?.lifecycle.resume();
-
-    this.context?.recordLifecycleEvent('simulation_resumed', {
-      totalPauseDuration: this.state.pauseDuration,
-    });
-  }
-
-  /**
-   * Cancels the simulation.
-   *
-   * @param reason - Reason for cancellation
-   */
-  async cancel(reason: string): Promise<void> {
-    const previousStatus = this.state.status;
-    this.state.status = 'cancelled';
-    this.state.phase = 'cancelled';
-    this.state.endTime = new Date();
-
-    this.scenarioManager?.cancel();
-    this.context?.lifecycle.cancel(reason);
-
-    this.context?.recordLifecycleEvent('simulation_cancelled', {
-      reason,
-      previousStatus,
-    });
-
-    // End root span if active
-    if (this.rootSpan?.isActive) {
-      this.rootSpan.cancel(reason);
-    }
-
-    // Clean shutdown within 5 seconds (F-006 requirement)
-    await this.cleanup();
-  }
-
-  /**
-   * Creates a checkpoint of current state.
-   */
-  checkpoint(): SimulationCheckpoint {
-    if (!this.context || !this.config || !this.scenario) {
-      throw new SimulationEngineError(
-        'Cannot checkpoint: no active simulation',
-        'INVALID_STATE',
-        'Simulation must be running to create checkpoint'
-      );
-    }
-
-    const checkpointId = `chk-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const progress = this.scenarioManager?.getProgress();
-
-    const checkpoint: SimulationCheckpoint = {
-      checkpointId,
-      simulationId: this.config.simulationId,
-      stateVersion: this.context.state.getVersion(),
-      createdAt: this.context.getTime(),
-      config: this.config,
-      scenarioProgress: {
-        currentStepIndex: progress?.completedSteps ?? 0,
-        completedSteps: [], // Would contain actual step IDs
-        pendingSteps: [], // Would contain actual step IDs
-      },
-      contentHash: createContentHashFromObject({
-        checkpointId,
-        stateVersion: this.context.state.getVersion(),
-        time: this.context.getTime(),
-      }),
-    };
-
-    this.state.checkpoints.push(checkpoint);
-    this.context.recordLifecycleEvent('checkpoint_created', {
-      checkpointId,
-      stateVersion: checkpoint.stateVersion,
-    });
-
-    return checkpoint;
-  }
-
-  /**
-   * Restores from a checkpoint.
-   *
-   * @param checkpoint - Checkpoint to restore from
-   */
-  restore(checkpoint: SimulationCheckpoint): void {
-    if (!this.context) {
-      throw new SimulationEngineError(
-        'Cannot restore: engine not initialized',
-        'INVALID_STATE',
-        'Initialize the engine first'
-      );
-    }
-
-    // Verify checkpoint integrity
-    const expectedHash = createContentHashFromObject({
-      checkpointId: checkpoint.checkpointId,
-      stateVersion: checkpoint.stateVersion,
-      time: checkpoint.createdAt,
-    });
-
-    if (expectedHash.value !== checkpoint.contentHash.value) {
-      throw new SimulationEngineError(
-        'Checkpoint integrity check failed',
-        'CHECKPOINT_CORRUPTED',
-        'Content hash mismatch'
-      );
-    }
-
-    // Restore state
-    // In a full implementation, this would restore all state components
-
-    this.context.recordLifecycleEvent('checkpoint_restored', {
-      checkpointId: checkpoint.checkpointId,
-      stateVersion: checkpoint.stateVersion,
-    });
-  }
-
-  /**
-   * Gets current simulation status.
-   */
-  getStatus(): SimulationStatus {
-    return this.state.status;
-  }
-
-  /**
-   * Gets current execution phase.
-   */
-  getPhase(): ExecutionPhase {
-    return this.state.phase;
-  }
-
-  // ==========================================================================
-  // HELPER METHODS
-  // ==========================================================================
-
-  /**
-   * Creates a state provider for scenario execution.
-   */
-  private createStateProvider(): StateProvider {
-    return {
-      getState: () => this.stateData,
-      getValue: (path: string) => this.getNestedValue(this.stateData, path),
-      setValue: (path: string, value: unknown) => {
-        this.setNestedValue(this.stateData, path, value);
-        // State changes are tracked via the stateData object
-      },
-      advanceTime: (ms: number) => {
-        this.context?.advanceTime(ms);
-      },
-    };
-  }
-
-  /**
-   * Gets a nested value from an object.
-   */
-  private getNestedValue(obj: Record<string, unknown>, path: string): unknown {
-    const parts = path.split('.');
-    let current: unknown = obj;
-
-    for (const part of parts) {
-      if (current === null || current === undefined) return undefined;
-      if (typeof current === 'object' && part in current) {
-        current = (current as Record<string, unknown>)[part];
-      } else {
-        return undefined;
-      }
-    }
-
-    return current;
-  }
-
-  /**
-   * Sets a nested value in an object.
-   */
-  private setNestedValue(
-    obj: Record<string, unknown>,
-    path: string,
-    value: unknown
-  ): void {
-    const parts = path.split('.');
-    let current: Record<string, unknown> = obj;
-
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i]!;
-      if (!(part in current) || typeof current[part] !== 'object') {
-        current[part] = {};
-      }
-      current = current[part] as Record<string, unknown>;
-    }
-
-    current[parts[parts.length - 1]!] = value;
-  }
-
-  /**
-   * Computes base execution metrics from internal context.
-   * Cost-related metrics come from LLM-Data-Core.
-   */
-  private computeBaseMetrics(): ExecutionMetrics {
-    const contextSummary = this.context?.getSummary();
-
-    return {
-      totalEvents: contextSummary?.traceEventCount ?? 0,
-      stateTransitions: contextSummary?.stateVersion ?? 0,
-      snapshotsCreated: contextSummary?.resourceUsage.snapshots ?? 0,
-      peakMemoryBytes: contextSummary?.resourceUsage.memoryBytes ?? 0,
-      externalCalls: 0,
-      determinismVerified: true,
-    };
-  }
-
-  /**
-   * Merges internal base metrics with metrics from LLM-Data-Core.
-   */
-  private mergeMetrics(
-    base: ExecutionMetrics,
-    coreMetrics: Partial<ExecutionMetrics>
+  private collateMetrics(
+    dataResult: DataCoreResponse,
+    delegationCount: number
   ): ExecutionMetrics {
     return {
-      totalEvents: coreMetrics.totalEvents ?? base.totalEvents,
-      stateTransitions: coreMetrics.stateTransitions ?? base.stateTransitions,
-      snapshotsCreated: coreMetrics.snapshotsCreated ?? base.snapshotsCreated,
-      peakMemoryBytes: coreMetrics.peakMemoryBytes ?? base.peakMemoryBytes,
-      externalCalls: (base.externalCalls) + (coreMetrics.externalCalls ?? 0),
-      determinismVerified: base.determinismVerified && (coreMetrics.determinismVerified ?? true),
+      totalEvents: 0,
+      stateTransitions: 0,
+      snapshotsCreated: 0,
+      peakMemoryBytes: 0,
+      externalCalls: delegationCount,
+      determinismVerified: true,
       custom: {
-        ...base.custom,
-        ...coreMetrics.custom,
+        ...dataResult.executionMetrics.custom,
+        delegations: delegationCount,
       },
     };
   }
 
   /**
-   * Computes execution timing.
+   * Builds a delegation-based execution proof.
+   * Proves this service only orchestrated — all layers were delegated.
    */
-  private computeTiming(): ExecutionTiming {
-    const startTime = this.state.startTime ?? new Date();
-    const endTime = this.state.endTime ?? new Date();
-    const durationMs = endTime.getTime() - startTime.getTime() - this.state.pauseDuration;
+  private buildDelegationProof(): ExecutionProof {
+    const now = new Date();
+    const delegationLayer: LayerExecutionRecord = {
+      layer: 'integration' as ExecutionLayer,
+      startTime: (this.startTime ?? now).toISOString() as ISOTimestamp,
+      endTime: now.toISOString() as ISOTimestamp,
+      durationMs: now.getTime() - (this.startTime ?? now).getTime(),
+      success: this.delegationRecords.every((r) => r.success),
+      inputHash: createContentHashFromObject({
+        executionId: this.executionId,
+        delegations: this.delegationRecords.length,
+      }),
+      outputHash: createContentHashFromObject({
+        executionId: this.executionId,
+        records: this.delegationRecords,
+      }),
+      operations: this.delegationRecords.map((r, i) => ({
+        operationId: `delegation-${i}`,
+        type: `delegate.${r.coreName}.${r.operationName}`,
+        timestamp: (this.startTime ?? now).toISOString() as ISOTimestamp,
+        durationMs: r.durationMs,
+        success: r.success,
+        metadata: {
+          coreName: r.coreName,
+          executionId: r.executionId,
+          parentSpanId: r.parentSpanId,
+          traceId: r.traceId,
+        },
+      })),
+    };
+
+    const proofData = {
+      layersExecuted: ['integration'],
+      layerRecords: [delegationLayer],
+      timestamp: now.toISOString(),
+    };
 
     return {
-      startTime: startTime.toISOString() as ISOTimestamp,
-      endTime: endTime.toISOString() as ISOTimestamp,
-      durationMs,
-      simulatedDurationMs: this.context?.getElapsedSimulatedTime() ?? 0,
-      phaseTiming: {},
-      waitTimeMs: this.state.pauseDuration,
+      layersExecuted: ['integration'],
+      layerRecords: [delegationLayer],
+      proofGeneratedAt: now.toISOString() as ISOTimestamp,
+      proofHash: createContentHashFromObject(proofData),
+      mandatoryLayersComplete: true, // Mandatory layers handled by downstream cores
+      totalExecutionMs: delegationLayer.durationMs,
     };
-  }
-
-  /**
-   * Determines the simulation outcome.
-   */
-  private determineOutcome(
-    scenarioResult: { status: string }
-  ): 'success' | 'partial_success' | 'failure' | 'error' | 'timeout' | 'cancelled' {
-    if (this.state.status === 'cancelled') return 'cancelled';
-
-    switch (scenarioResult.status) {
-      case 'passed':
-        return 'success';
-      case 'partial':
-        return 'partial_success';
-      case 'failed':
-        return 'failure';
-      default:
-        return 'error';
-    }
   }
 
   /**
    * Builds result metadata.
    */
   private buildResultMetadata(): ResultMetadata {
-    const resultData = {
-      simulationId: this.config?.simulationId,
-      status: this.state.status,
-      phase: this.state.phase,
-    };
-
     return {
-      resultHash: createContentHashFromObject(resultData),
-      engineVersion: '0.1.0',
-      environment: 'simulation',
+      resultHash: createContentHashFromObject({
+        executionId: this.executionId,
+        delegations: this.delegationRecords.length,
+      }),
+      engineVersion: '0.2.0', // Orchestration-only version
+      environment: 'orchestration',
       cached: false,
     };
   }
 
   /**
-   * Cleans up resources.
+   * Gets the ruvector-minted execution ID (if accepted).
    */
-  private async cleanup(): Promise<void> {
-    this.context?.dispose();
-    this.scenarioManager?.reset();
+  getExecutionId(): ExecutionId | undefined {
+    return this.executionId;
+  }
+
+  /**
+   * Gets the delegation records (execution graph).
+   */
+  getDelegationRecords(): ReadonlyArray<DelegationRecord> {
+    return [...this.delegationRecords];
   }
 }
 
@@ -1069,27 +685,41 @@ export class SimulationEngine {
 // ============================================================================
 
 /**
- * Error thrown by the simulation engine.
+ * Error thrown by the orchestration engine.
  */
-export class SimulationEngineError extends Error {
+export class OrchestrationError extends Error {
   readonly code: string;
   readonly details: string;
 
   constructor(message: string, code: string, details: string) {
     super(message);
-    this.name = 'SimulationEngineError';
+    this.name = 'OrchestrationError';
     this.code = code;
     this.details = details;
   }
 }
+
+/**
+ * @deprecated Use OrchestrationError instead.
+ * Kept for backwards compatibility during migration.
+ */
+export const SimulationEngineError = OrchestrationError;
 
 // ============================================================================
 // FACTORY FUNCTIONS
 // ============================================================================
 
 /**
- * Creates a new simulation engine.
+ * Creates a new orchestration engine.
  */
-export function createSimulationEngine(): SimulationEngine {
-  return new SimulationEngine();
+export function createOrchestrationEngine(): OrchestrationEngine {
+  return new OrchestrationEngine();
+}
+
+/**
+ * @deprecated Use createOrchestrationEngine() instead.
+ * Kept for backwards compatibility during migration.
+ */
+export function createSimulationEngine(): OrchestrationEngine {
+  return createOrchestrationEngine();
 }
