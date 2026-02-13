@@ -3,13 +3,17 @@ FROM node:20 AS builder
 
 WORKDIR /app
 
-# Copy package files
+# Copy package files and local packages
 COPY package*.json ./
+COPY packages/ ./packages/
 
 # Install all dependencies (including dev for build)
-RUN npm ci
+RUN npm install
 
-# Copy source code and contracts
+# Build the local contracts package first
+RUN cd packages/agentics-contracts && npm install && npm run build
+
+# Copy source code
 COPY tsconfig.json ./
 COPY src/ ./src/
 
@@ -30,11 +34,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy package files
+# Copy package files and local packages
 COPY package*.json ./
+COPY packages/ ./packages/
 
 # Install production dependencies only
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
+
+# Copy built contracts package from builder
+COPY --from=builder /app/packages/agentics-contracts/dist ./packages/agentics-contracts/dist
 
 # Copy built files from builder with proper ownership
 COPY --from=builder --chown=node:node /app/dist ./dist
