@@ -499,6 +499,86 @@ function createDefaultConfig(scenario: Scenario): SimulationConfig {
 }
 
 // ============================================================================
+// RESULTS INDEX PERSISTENCE
+// ============================================================================
+
+const RESULTS_INDEX_ENDPOINT = process.env['RESULTS_INDEX_ENDPOINT'] ?? 'http://localhost:8090';
+
+/**
+ * Publishes execution metadata to the agentics-results-index after simulation completion.
+ *
+ * PRECONDITION: mandatoryLayersComplete MUST be true.
+ * FAIL-OPEN: If the write fails, simulation still returns success.
+ * DOES NOT write directly to database — only calls results-index API.
+ */
+async function publishToResultsIndex(
+  executionId: ExecutionId,
+  simulationId: SimulationId,
+  result: SimulationResult
+): Promise<void> {
+  const proof = result.executionProof;
+
+  // Gate: ONLY write after mandatory layers are confirmed complete
+  if (proof.mandatoryLayersComplete !== true) {
+    console.log('[RESULTS_INDEX_WRITE] Skipped — mandatoryLayersComplete is false', {
+      execution_id: executionId,
+      simulation_id: simulationId,
+      status: 'skipped',
+    });
+    return;
+  }
+
+  const payload = {
+    execution_id: executionId,
+    simulation_id: simulationId,
+    environment: result.metadata.environment,
+    metadata: {
+      execution_id: executionId,
+      simulation_id: simulationId,
+      execution_proof: proof,
+      layers_executed: [...proof.layersExecuted],
+      timestamp: new Date().toISOString(),
+      status: result.status,
+    },
+  };
+
+  try {
+    const response = await fetch(`${RESULTS_INDEX_ENDPOINT}/api/v1/runs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '<unreadable>');
+      console.error('[RESULTS_INDEX_WRITE] Non-OK response from results-index', {
+        execution_id: executionId,
+        simulation_id: simulationId,
+        status: 'failed',
+        http_status: response.status,
+        body,
+      });
+      return;
+    }
+
+    console.log('[RESULTS_INDEX_WRITE] Successfully published to results-index', {
+      execution_id: executionId,
+      simulation_id: simulationId,
+      status: 'written',
+    });
+  } catch (error) {
+    // FAIL-OPEN: Log the error but do not throw — simulation still succeeds
+    console.error('[RESULTS_INDEX_WRITE] Failed to publish to results-index', {
+      execution_id: executionId,
+      simulation_id: simulationId,
+      status: 'error',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ============================================================================
 // RUVECTOR CLIENT SETUP
 // ============================================================================
 
@@ -605,6 +685,14 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 
     // Orchestrate — blocks until ruvector acceptance, delegates everything
     const orchestrationResult = await engine.orchestrate(orchestrationConfig);
+
+    // Publish to results-index AFTER executionProof generation, BEFORE HTTP response.
+    // Gated on mandatoryLayersComplete === true. Fail-open: errors do not block success.
+    await publishToResultsIndex(
+      orchestrationResult.executionId,
+      orchestrationResult.result.simulationId,
+      orchestrationResult.result
+    );
 
     // Return with ruvector-minted execution_id
     sendSimulateSuccess(res, orchestrationResult.result, orchestrationResult.executionId);
