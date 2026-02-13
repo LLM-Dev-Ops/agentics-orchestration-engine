@@ -7,11 +7,11 @@ WORKDIR /app
 COPY package*.json ./
 COPY packages/ ./packages/
 
+# Build the local contracts package first (must exist before npm install resolves it)
+RUN cd packages/agentics-contracts && npm install && npm run build
+
 # Install all dependencies (including dev for build)
 RUN npm install
-
-# Build the local contracts package first
-RUN cd packages/agentics-contracts && npm install && npm run build
 
 # Copy source code
 COPY tsconfig.json ./
@@ -34,17 +34,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy package files and local packages
-COPY package*.json ./
-COPY packages/ ./packages/
+# Copy everything needed for npm ci from builder (not context)
+# This ensures package-lock.json matches builder's resolved state
+# and packages/ includes the built contracts dist/
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/packages ./packages
 
 # Install production dependencies only
-RUN npm install --omit=dev
+# bundledDependencies ensures @agentics/contracts is copied, not symlinked
+RUN npm ci --omit=dev
 
-# Copy built contracts package from builder
-COPY --from=builder /app/packages/agentics-contracts/dist ./packages/agentics-contracts/dist
+# Verify @agentics/contracts is installed and resolvable
+# This FAILS the image build if contracts cannot resolve
+RUN node -e "require.resolve('@agentics/contracts')" \
+    && echo '[contracts] resolved in production image'
 
-# Copy built files from builder with proper ownership
+# Copy built application from builder
 COPY --from=builder --chown=node:node /app/dist ./dist
 
 # Set environment variables

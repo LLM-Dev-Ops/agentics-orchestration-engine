@@ -745,6 +745,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 }
 
 // ============================================================================
+// CONTRACT DEPENDENCY GUARD
+// ============================================================================
+
+try {
+  await import('@agentics/contracts');
+  console.log('[contracts] loaded');
+} catch (err) {
+  console.error('[contracts] missing', err);
+  process.exit(1);
+}
+
+// ============================================================================
 // SERVER STARTUP
 // ============================================================================
 
