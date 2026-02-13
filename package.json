@@ -31,6 +31,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@agentics/contracts": "file:packages/agentics-contracts",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "claude-flow": "^3.0.0-alpha.179",

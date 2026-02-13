@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agentics.dev/contracts/simulation/v1/result-packet.schema.json",
+  "title": "ResultPacket",
+  "description": "Canonical payload for POST to results-index /api/v1/runs endpoint",
+  "type": "object",
+  "required": [
+    "execution_id",
+    "simulation_id",
+    "simulation_resolution",
+    "metadata",
+    "execution_proof",
+    "environment"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "execution_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Ruvector-minted canonical execution ID"
+    },
+    "simulation_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Scenario-level simulation reference ID"
+    },
+    "simulation_resolution": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Final resolution of the simulation execution"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Result metadata from the simulation"
+    },
+    "execution_proof": {
+      "type": "object",
+      "required": [
+        "layersExecuted",
+        "proofHash",
+        "mandatoryLayersComplete",
+        "proofGeneratedAt",
+        "totalExecutionMs"
+      ],
+      "properties": {
+        "layersExecuted": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "layerRecords": {
+          "type": "array"
+        },
+        "proofGeneratedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "proofHash": {
+          "type": "object",
+          "required": ["algorithm", "value"],
+          "properties": {
+            "algorithm": { "type": "string" },
+            "value": { "type": "string" }
+          }
+        },
+        "mandatoryLayersComplete": { "type": "boolean" },
+        "totalExecutionMs": {
+          "type": "number",
+          "minimum": 0
+        },
+        "executionGraph": { "type": "object" }
+      }
+    },
+    "environment": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deployment environment"
+    }
+  }
+}

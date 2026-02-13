@@ -1,0 +1,599 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agentics.dev/contracts/simulation/v1/request.schema.json",
+  "title": "SimulateRequest",
+  "description": "Request payload for the POST /v1/simulate endpoint",
+  "type": "object",
+  "required": ["scenario"],
+  "additionalProperties": false,
+  "properties": {
+    "config": {
+      "$ref": "#/$defs/SimulationConfigPartial"
+    },
+    "scenario": {
+      "$ref": "#/$defs/Scenario"
+    }
+  },
+  "$defs": {
+    "SimulationConfigPartial": {
+      "type": "object",
+      "description": "Partial simulation configuration (optional fields override defaults)",
+      "additionalProperties": false,
+      "properties": {
+        "simulationId": {
+          "type": "string",
+          "pattern": "^sim-[a-zA-Z0-9-]+$",
+          "description": "Unique identifier for this simulation run"
+        },
+        "engineVersion": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "scenario": {
+          "$ref": "#/$defs/ScenarioReference"
+        },
+        "policies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PolicyReference" }
+        },
+        "resourceLimits": {
+          "$ref": "#/$defs/ResourceLimits"
+        },
+        "timing": {
+          "$ref": "#/$defs/TimingConfig"
+        },
+        "dataSources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/DataSourceConfig" }
+        },
+        "artifactConfig": {
+          "$ref": "#/$defs/ArtifactConfig"
+        },
+        "observability": {
+          "$ref": "#/$defs/ObservabilityConfig"
+        },
+        "metadata": {
+          "$ref": "#/$defs/SimulationMetadata"
+        }
+      }
+    },
+    "SemanticVersion": {
+      "type": "object",
+      "required": ["major", "minor", "patch"],
+      "additionalProperties": false,
+      "properties": {
+        "major": { "type": "integer", "minimum": 0 },
+        "minor": { "type": "integer", "minimum": 0 },
+        "patch": { "type": "integer", "minimum": 0 },
+        "prerelease": { "type": "string" },
+        "build": { "type": "string" }
+      }
+    },
+    "ScenarioReference": {
+      "type": "object",
+      "required": ["scenarioId"],
+      "additionalProperties": false,
+      "properties": {
+        "scenarioId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique identifier for the scenario"
+        },
+        "version": { "type": "string" },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "PolicyReference": {
+      "type": "object",
+      "required": ["policyId"],
+      "additionalProperties": false,
+      "properties": {
+        "policyId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": { "type": "string" },
+        "overrides": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "ResourceLimits": {
+      "type": "object",
+      "required": ["maxExecutionTimeMs", "maxMemoryBytes", "maxConcurrency", "maxSnapshots", "maxTraceEvents"],
+      "additionalProperties": false,
+      "properties": {
+        "maxExecutionTimeMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Maximum wall-clock execution time in milliseconds"
+        },
+        "maxMemoryBytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Maximum memory usage in bytes"
+        },
+        "maxConcurrency": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Maximum concurrent operations"
+        },
+        "maxSnapshots": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum number of state snapshots"
+        },
+        "maxTraceEvents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum number of trace events"
+        }
+      }
+    },
+    "TimingConfig": {
+      "type": "object",
+      "required": ["mode", "simulatedStartTime"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["controlled", "accelerated", "real"],
+          "description": "Time advancement mode"
+        },
+        "accelerationFactor": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Acceleration factor for accelerated mode"
+        },
+        "stepDurationMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Step duration for controlled mode"
+        },
+        "simulatedStartTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Simulated start time (ISO 8601)"
+        }
+      }
+    },
+    "DataSourceConfig": {
+      "type": "object",
+      "required": ["type", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["erp-surface", "costops", "mock", "inline"]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "refreshPolicy": {
+          "type": "string",
+          "enum": ["once", "on_demand", "periodic"]
+        }
+      }
+    },
+    "ArtifactConfig": {
+      "type": "object",
+      "required": ["generateReport", "generatePolicyLog", "generateStateSnapshots", "generateTrace", "formats", "signArtifacts"],
+      "additionalProperties": false,
+      "properties": {
+        "generateReport": { "type": "boolean" },
+        "generatePolicyLog": { "type": "boolean" },
+        "generateStateSnapshots": { "type": "boolean" },
+        "generateTrace": { "type": "boolean" },
+        "formats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["json", "yaml", "html", "pdf"]
+          },
+          "minItems": 1
+        },
+        "signArtifacts": { "type": "boolean" },
+        "storageConfig": {
+          "type": "object",
+          "required": ["type", "basePath"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["local", "s3", "gcs", "azure_blob"]
+            },
+            "basePath": { "type": "string" },
+            "credentials": { "type": "string" }
+          }
+        }
+      }
+    },
+    "ObservabilityConfig": {
+      "type": "object",
+      "required": ["logLevel", "enableMetrics", "enableTracing", "traceSamplingRate"],
+      "additionalProperties": false,
+      "properties": {
+        "logLevel": {
+          "type": "string",
+          "enum": ["trace", "debug", "info", "warn", "error"]
+        },
+        "enableMetrics": { "type": "boolean" },
+        "enableTracing": { "type": "boolean" },
+        "traceSamplingRate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "exporters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type"],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["console", "otlp", "jaeger"]
+              },
+              "endpoint": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "SimulationMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "seed": { "type": "integer" },
+        "requestedBy": {
+          "type": "object",
+          "required": ["type", "id"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["user", "api", "scheduler"]
+            },
+            "id": { "type": "string" },
+            "name": { "type": "string" }
+          }
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "critical"]
+        }
+      }
+    },
+    "Scenario": {
+      "type": "object",
+      "required": ["scenarioId", "version", "name", "description", "category", "tags", "preconditions", "setup", "steps", "teardown", "expectations"],
+      "additionalProperties": false,
+      "properties": {
+        "scenarioId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique identifier for the scenario"
+        },
+        "version": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["deployment", "policy", "integration", "failure", "performance", "compliance", "migration", "what-if", "custom"]
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "parameterDefinitions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ParameterDefinition" }
+        },
+        "defaultParameters": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "preconditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Precondition" }
+        },
+        "setup": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SetupStep" }
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ScenarioStep" }
+        },
+        "teardown": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TeardownStep" }
+        },
+        "expectations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Expectation" }
+        },
+        "postconditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Postcondition" }
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0
+        },
+        "parallelizable": { "type": "boolean" },
+        "dependencies": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "author": { "type": "string" },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/ContentHash"
+        }
+      }
+    },
+    "ParameterDefinition": {
+      "type": "object",
+      "required": ["name", "type", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "type": {
+          "type": "string",
+          "enum": ["string", "number", "boolean", "array", "object"]
+        },
+        "description": { "type": "string" },
+        "required": { "type": "boolean" },
+        "default": {},
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min": { "type": "number" },
+            "max": { "type": "number" },
+            "pattern": { "type": "string" },
+            "enum": { "type": "array" }
+          }
+        }
+      }
+    },
+    "Precondition": {
+      "type": "object",
+      "required": ["id", "description", "expression"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "expression": { "type": "string" },
+        "errorMessage": { "type": "string" }
+      }
+    },
+    "Postcondition": {
+      "type": "object",
+      "required": ["id", "description", "expression", "severity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "expression": { "type": "string" },
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning"]
+        }
+      }
+    },
+    "SetupStep": {
+      "type": "object",
+      "required": ["id", "name", "type", "config", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["data_injection", "state_mutation", "mock_setup", "custom"]
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "required": { "type": "boolean" }
+      }
+    },
+    "TeardownStep": {
+      "type": "object",
+      "required": ["id", "name", "type", "config", "alwaysRun"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["cleanup", "verify", "report", "custom"]
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "alwaysRun": { "type": "boolean" }
+      }
+    },
+    "ScenarioStep": {
+      "type": "object",
+      "required": ["stepId", "name", "order", "type", "config"],
+      "additionalProperties": false,
+      "properties": {
+        "stepId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "order": {
+          "$ref": "#/$defs/StepOrder"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["agent_action", "data_injection", "state_mutation", "policy_evaluation", "assertion", "delay", "branch", "loop", "subprocess", "checkpoint", "custom"]
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "when": {
+          "$ref": "#/$defs/StepCondition"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryConfig"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0
+        },
+        "assertions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/StepAssertion" }
+        },
+        "continueOnFailure": { "type": "boolean" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "StepOrder": {
+      "type": "object",
+      "required": ["index"],
+      "additionalProperties": false,
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "parallelGroup": { "type": "string" },
+        "dependsOn": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "StepCondition": {
+      "type": "object",
+      "required": ["lang", "expression"],
+      "additionalProperties": false,
+      "properties": {
+        "lang": {
+          "type": "string",
+          "enum": ["jsonpath", "jmespath", "custom"]
+        },
+        "expression": { "type": "string" },
+        "onFalse": {
+          "type": "string",
+          "enum": ["skip", "fail", "warn"]
+        }
+      }
+    },
+    "RetryConfig": {
+      "type": "object",
+      "required": ["maxAttempts", "delayMs"],
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": { "type": "integer", "minimum": 1 },
+        "delayMs": { "type": "integer", "minimum": 0 },
+        "backoffMultiplier": { "type": "number", "exclusiveMinimum": 0 },
+        "maxDelayMs": { "type": "integer", "minimum": 0 },
+        "retryableErrors": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "StepAssertion": {
+      "type": "object",
+      "required": ["id", "type", "expression", "severity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": {
+          "type": "string",
+          "enum": ["equals", "not_equals", "contains", "matches", "greater_than", "less_than", "exists", "not_exists", "custom"]
+        },
+        "description": { "type": "string" },
+        "expression": { "type": "string" },
+        "expected": {},
+        "message": { "type": "string" },
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning"]
+        }
+      }
+    },
+    "Expectation": {
+      "type": "object",
+      "required": ["id", "description", "type", "expression", "severity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["state", "output", "policy", "performance", "custom"]
+        },
+        "expression": { "type": "string" },
+        "expected": {},
+        "tolerance": { "type": "number" },
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning", "info"]
+        }
+      }
+    },
+    "ContentHash": {
+      "type": "object",
+      "required": ["algorithm", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "const": "sha256"
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    }
+  }
+}

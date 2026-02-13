@@ -9,6 +9,7 @@
 
 export {
   validateSimulateRequest,
+  validateResultPacket,
   formatValidationErrors,
   createContractViolationResponse,
   isValidSimulateRequest,

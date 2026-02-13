@@ -349,6 +349,8 @@ export interface ExecutionAcceptanceResponse {
   readonly root_span_id?: SpanId;
   /** Trace ID for distributed tracing (only present if accepted) */
   readonly trace_id?: TraceId;
+  /** Simulation resolution from upstream context */
+  readonly simulation_resolution?: string;
   /** Rejection reason (only present if rejected) */
   readonly rejection_reason?: string;
   /** Rejection code (only present if rejected) */

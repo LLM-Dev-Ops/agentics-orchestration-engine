@@ -30,6 +30,7 @@ import {
 import type { RuvectorClientConfig } from './ruvector/types.js';
 import {
   validateSimulateRequest,
+  validateResultPacket,
   formatValidationErrors,
   type ContractValidationError,
 } from './contracts/index.js';
@@ -80,6 +81,7 @@ interface ExecutionMetadata {
   timestamp: string;
   execution_id: string | null;
   simulation_id: string | null;
+  simulation_resolution: string | null;
   status: 'error' | 'success' | 'partial_success' | 'failure' | 'timeout' | 'cancelled';
   error_code?: string;
   error_phase?: string;
@@ -354,6 +356,7 @@ function createErrorExecutionMetadata(code: string, phase: string): ExecutionMet
     timestamp: new Date().toISOString(),
     execution_id: null,
     simulation_id: null,
+    simulation_resolution: null,
     status: 'error',
     error_code: code,
     error_phase: phase,
@@ -363,7 +366,8 @@ function createErrorExecutionMetadata(code: string, phase: string): ExecutionMet
 
 function createSuccessExecutionMetadata(
   result: SimulationResult,
-  executionId: ExecutionId
+  executionId: ExecutionId,
+  simulationResolution: string
 ): ExecutionMetadata {
   return {
     service: SERVICE_NAME,
@@ -371,6 +375,7 @@ function createSuccessExecutionMetadata(
     timestamp: new Date().toISOString(),
     execution_id: executionId,
     simulation_id: result.simulationId,
+    simulation_resolution: simulationResolution,
     status: result.status,
     execution_proof: result.executionProof,
     layers_executed: result.executionProof.layersExecuted,
@@ -419,13 +424,14 @@ function sendSimulateError(
 function sendSimulateSuccess(
   res: ServerResponse,
   result: SimulationResult,
-  executionId: ExecutionId
+  executionId: ExecutionId,
+  simulationResolution: string
 ): void {
   const response: SimulateSuccessResponse = {
     success: true,
     result,
     execution_id: executionId,
-    execution_metadata: createSuccessExecutionMetadata(result, executionId),
+    execution_metadata: createSuccessExecutionMetadata(result, executionId, simulationResolution),
   };
   sendSimulateResponse(res, 200, response);
 }
@@ -606,32 +612,50 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     // Orchestrate — blocks until ruvector acceptance, delegates everything
     const orchestrationResult = await engine.orchestrate(orchestrationConfig);
 
-    // Fire-and-forget: persist to results-index after executionProof is finalized.
+    // Persist to results-index with contract validation
     const RESULTS_INDEX_URL = process.env['RESULTS_INDEX_URL'];
 
     if (!RESULTS_INDEX_URL) {
       console.warn('[RESULTS_INDEX_WRITE] skipped — RESULTS_INDEX_URL missing');
     } else {
-      fetch(`${RESULTS_INDEX_URL}/api/v1/runs`, {
+      const resultPacket = {
+        execution_id: orchestrationResult.executionId,
+        simulation_id: orchestrationResult.result?.simulationId,
+        simulation_resolution: orchestrationResult.simulation_resolution,
+        metadata: orchestrationResult.result?.metadata ?? {},
+        execution_proof: orchestrationResult.result?.executionProof,
+        environment: process.env['ENVIRONMENT'] ?? 'production',
+      };
+
+      // Validate outbound payload against result-packet contract schema
+      const packetValidation = validateResultPacket(resultPacket);
+      if (!packetValidation.valid) {
+        throw new Error(
+          `Result packet contract validation failed: ${formatValidationErrors(packetValidation.errors)}`
+        );
+      }
+
+      // Await the write — do NOT fire-and-forget
+      const writeResponse = await fetch(`${RESULTS_INDEX_URL}/api/v1/runs`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           'authorization': `Bearer ${process.env['PLATFORM_API_KEY']}`,
         },
-        body: JSON.stringify({
-          execution_id: orchestrationResult.executionId,
-          simulation_id: orchestrationResult.result?.simulationId,
-          metadata: orchestrationResult.result?.metadata ?? {},
-          execution_proof: orchestrationResult.result?.executionProof,
-          environment: process.env['ENVIRONMENT'] ?? 'production',
-        }),
-      })
-        .then(() => console.log('[RESULTS_INDEX_WRITE] success'))
-        .catch((err: unknown) => console.error('[RESULTS_INDEX_WRITE] failed', err));
+        body: JSON.stringify(resultPacket),
+      });
+
+      if (!writeResponse.ok) {
+        throw new Error(
+          `Results-index write failed: ${writeResponse.status} ${writeResponse.statusText}`
+        );
+      }
+
+      console.log('[RESULTS_INDEX_WRITE] success');
     }
 
     // Return with ruvector-minted execution_id
-    sendSimulateSuccess(res, orchestrationResult.result, orchestrationResult.executionId);
+    sendSimulateSuccess(res, orchestrationResult.result, orchestrationResult.executionId, orchestrationResult.simulation_resolution);
   } catch (error) {
     console.error("ORCHESTRATION ERROR:", error);
     if (error instanceof Error && error.stack) {

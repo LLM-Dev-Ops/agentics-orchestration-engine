@@ -85,6 +85,8 @@ export interface OrchestrationConfig {
   readonly scenario: Scenario;
   /** Source engine identifier */
   readonly engineId: string;
+  /** Simulation resolution from upstream context */
+  readonly simulation_resolution?: string;
 }
 
 /**
@@ -97,6 +99,8 @@ export interface OrchestrationResult {
   readonly result: SimulationResult;
   /** Execution graph with all spans attached under ruvector's root */
   readonly executionGraph: DelegationRecord[];
+  /** Final simulation resolution */
+  readonly simulation_resolution: string;
 }
 
 /**
@@ -214,10 +218,25 @@ export class OrchestrationEngine {
       );
     }
 
-    // Store the ruvector-minted canonical IDs
+    // Store the ruvector-minted canonical IDs — enforce presence
+    if (!acceptance.root_span_id) {
+      throw new OrchestrationError(
+        'Ruvector acceptance missing root_span_id',
+        'MISSING_ROOT_SPAN_ID',
+        `execution_id=${acceptance.execution_id}, simulation_id=${config.simulationId}`
+      );
+    }
+    if (!acceptance.trace_id) {
+      throw new OrchestrationError(
+        'Ruvector acceptance missing trace_id',
+        'MISSING_TRACE_ID',
+        `execution_id=${acceptance.execution_id}, simulation_id=${config.simulationId}`
+      );
+    }
+
     this.executionId = acceptance.execution_id;
-    this.rootSpanId = acceptance.root_span_id!;
-    this.traceId = acceptance.trace_id!;
+    this.rootSpanId = acceptance.root_span_id;
+    this.traceId = acceptance.trace_id;
 
     console.log('[OrchestrationEngine] Ruvector accepted execution', {
       execution_id: this.executionId,
@@ -232,6 +251,7 @@ export class OrchestrationEngine {
     this.rootSpan = new TraceSpan('orchestration.delegate', 'orchestration-engine', {
       traceId: this.traceId,
       parentSpanId: this.rootSpanId,
+      repo_name: 'agentics-simulation-engine',
       attributes: {
         'execution.id': this.executionId,
         'simulation.id': config.simulationId,
@@ -378,10 +398,16 @@ export class OrchestrationEngine {
         executionProof,
       };
 
+      // Resolve simulation_resolution from ruvector acceptance, upstream config, or result status
+      const simulation_resolution = acceptance.simulation_resolution
+        ?? config.simulation_resolution
+        ?? result.status;
+
       return {
         executionId: this.executionId,
         result,
         executionGraph: [...this.delegationRecords],
+        simulation_resolution,
       };
     } catch (error) {
       // End root span as failed if active
@@ -421,8 +447,12 @@ export class OrchestrationEngine {
       source: config.engineId,
     });
 
+    if (!this.ruvectorClient) {
+      throw new OrchestrationError('Ruvector client not initialized', 'NO_RUVECTOR_CLIENT', 'Cannot request acceptance without ruvector client');
+    }
+
     try {
-      const response = await this.ruvectorClient!.requestExecutionAcceptance(request);
+      const response = await this.ruvectorClient.requestExecutionAcceptance(request);
       return response;
     } catch (error) {
       throw new OrchestrationError(
@@ -463,14 +493,30 @@ export class OrchestrationEngine {
       'simulationId' | 'traceId' | 'parentSpanId' | 'requestedAt' | 'timeoutMs'
     >
   ): Promise<TRes> {
+    // Guard: rootSpan and executionId must be set before delegation
+    if (!this.rootSpan) {
+      throw new OrchestrationError(
+        'Root span not initialized before delegation',
+        'NO_ROOT_SPAN',
+        `core=${client.coreName}, operation=${operationName}`
+      );
+    }
+    if (!this.executionId) {
+      throw new OrchestrationError(
+        'Execution ID not set before delegation',
+        'NO_EXECUTION_ID',
+        `core=${client.coreName}, operation=${operationName}`
+      );
+    }
+
     // 1. Create a child span under the orchestration root
     //    All spans are attached under ruvector's root span hierarchy
-    const coreSpan = this.rootSpan!.startChild(
+    const coreSpan = this.rootSpan.startChild(
       `core.${client.coreName}.${operationName}`
     );
     coreSpan.setAttribute('core.name', client.coreName);
     coreSpan.setAttribute('core.operation', operationName);
-    coreSpan.setAttribute('execution.id', this.executionId!);
+    coreSpan.setAttribute('execution.id', this.executionId);
 
     const spanContext = extractSpanContext(coreSpan);
     const delegationStart = Date.now();
@@ -478,7 +524,7 @@ export class OrchestrationEngine {
     // 2. Build request with ruvector-minted execution_id and propagated span context
     const request = {
       ...requestData,
-      simulationId: this.executionId! as unknown as SimulationId, // Use execution_id as canonical
+      simulationId: this.executionId as unknown as SimulationId, // Use execution_id as canonical
       traceId: spanContext.traceId,
       parentSpanId: spanContext.spanId,
       requestedAt: new Date().toISOString() as ISOTimestamp,
@@ -527,7 +573,7 @@ export class OrchestrationEngine {
       this.delegationRecords.push({
         coreName: client.coreName,
         operationName,
-        executionId: this.executionId!,
+        executionId: this.executionId,
         parentSpanId: spanContext.spanId,
         traceId: spanContext.traceId,
         durationMs: delegationDuration,
@@ -548,7 +594,7 @@ export class OrchestrationEngine {
       this.delegationRecords.push({
         coreName: client.coreName,
         operationName,
-        executionId: this.executionId!,
+        executionId: this.executionId,
         parentSpanId: spanContext.spanId,
         traceId: spanContext.traceId,
         durationMs: delegationDuration,

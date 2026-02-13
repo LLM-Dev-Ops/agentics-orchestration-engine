@@ -457,7 +457,12 @@ export class ExecutionListener {
     try {
       await this.ruvectorClient.emitLifecycleEvent(event);
     } catch (error) {
-      console.error('[ExecutionListener] Failed to emit started event:', error);
+      console.error('[ExecutionListener] Failed to emit started event:', {
+        error,
+        plan_id: planId,
+        simulation_id: simulationId,
+      });
+      throw error;
     }
   }
 
@@ -487,7 +492,12 @@ export class ExecutionListener {
     try {
       await this.ruvectorClient.emitLifecycleEvent(event);
     } catch (error) {
-      console.error('[ExecutionListener] Failed to emit completed event:', error);
+      console.error('[ExecutionListener] Failed to emit completed event:', {
+        error,
+        plan_id: planId,
+        simulation_id: simulationId,
+      });
+      throw error;
     }
   }
 
@@ -514,7 +524,13 @@ export class ExecutionListener {
     try {
       await this.ruvectorClient.emitLifecycleEvent(event);
     } catch (emitError) {
-      console.error('[ExecutionListener] Failed to emit failed event:', emitError);
+      console.error('[ExecutionListener] CRITICAL: Failed to emit failed event:', {
+        emitError,
+        original_error: errorInfo,
+        plan_id: planId,
+        simulation_id: simulationId,
+      });
+      // Do not re-throw — already in failure handler. Original error takes precedence.
     }
   }
 

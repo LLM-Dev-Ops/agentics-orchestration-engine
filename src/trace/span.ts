@@ -70,6 +70,7 @@ export interface TraceSpanData {
   readonly parentSpanId: SpanId | null;
   readonly operationName: string;
   readonly serviceName: string;
+  readonly repo_name?: string;
   readonly startTime: ISOTimestamp;
   readonly endTime: ISOTimestamp | null;
   readonly status: SpanStatus;
@@ -97,6 +98,7 @@ export class TraceSpan {
   private readonly _parentSpanId: SpanId | null;
   private readonly _operationName: string;
   private readonly _serviceName: string;
+  private readonly _repoName?: string;
   private readonly _startTime: Date;
   private _endTime: Date | null = null;
   private _status: SpanStatus = 'active';
@@ -117,6 +119,7 @@ export class TraceSpan {
       startTime?: ISOTimestamp;
       attributes?: Record<string, unknown>;
       getTime?: () => ISOTimestamp;
+      repo_name?: string;
     }
   ) {
     this._spanId = createSpanId(generateId());
@@ -124,6 +127,7 @@ export class TraceSpan {
     this._parentSpanId = options?.parentSpanId ?? null;
     this._operationName = operationName;
     this._serviceName = serviceName;
+    this._repoName = options?.repo_name;
     this._startTime = options?.startTime ? new Date(options.startTime) : new Date();
     this._getTime = options?.getTime ?? (() => new Date().toISOString() as ISOTimestamp);
 
@@ -156,6 +160,10 @@ export class TraceSpan {
 
   get serviceName(): string {
     return this._serviceName;
+  }
+
+  get repo_name(): string {
+    return this._repoName ?? this._serviceName;
   }
 
   get status(): SpanStatus {
@@ -387,6 +395,7 @@ export class TraceSpan {
       parentSpanId: this._parentSpanId,
       operationName: this._operationName,
       serviceName: this._serviceName,
+      repo_name: this._repoName ?? this._serviceName,
       startTime: this._startTime.toISOString() as ISOTimestamp,
       endTime: this._endTime?.toISOString() as ISOTimestamp | null,
       status: this._status,
