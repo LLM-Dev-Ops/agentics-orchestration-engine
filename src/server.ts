@@ -499,51 +499,6 @@ function createDefaultConfig(scenario: Scenario): SimulationConfig {
 }
 
 // ============================================================================
-// RESULTS INDEX PERSISTENCE
-// ============================================================================
-
-/**
- * Fire-and-forget POST to agentics-results-index.
- * ONLY fires when mandatoryLayersComplete === true.
- * Never blocks simulation success. Does NOT write to database directly.
- */
-function writeResultsIndex(
-  executionId: ExecutionId,
-  simulationId: SimulationId,
-  executionProof: SimulationResult['executionProof']
-): void {
-  if (executionProof.mandatoryLayersComplete !== true) {
-    return;
-  }
-
-  const payload = {
-    execution_id: executionId,
-    simulation_id: simulationId,
-    environment: process.env['AGENTICS_ENV'] || 'simulation',
-    metadata: {
-      execution_id: executionId,
-      simulation_id: simulationId,
-      execution_proof: executionProof,
-      layers_executed: [...executionProof.layersExecuted],
-      status: 'success',
-      timestamp: new Date().toISOString(),
-    },
-  };
-
-  fetch('https://agentics-results-index-1062287243982.us-central1.run.app/api/v1/runs', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
-    .then(() => {
-      console.log('[RESULTS_INDEX_WRITE]', executionId, simulationId, 'success');
-    })
-    .catch((err: unknown) => {
-      console.error('[RESULTS_INDEX_WRITE]', executionId, simulationId, 'failed', err);
-    });
-}
-
-// ============================================================================
 // RUVECTOR CLIENT SETUP
 // ============================================================================
 
@@ -652,12 +607,28 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
     const orchestrationResult = await engine.orchestrate(orchestrationConfig);
 
     // Fire-and-forget: persist to results-index after executionProof is finalized.
-    // Gated on mandatoryLayersComplete === true. Never blocks response.
-    writeResultsIndex(
-      orchestrationResult.executionId,
-      orchestrationResult.result.simulationId,
-      orchestrationResult.result.executionProof
-    );
+    const RESULTS_INDEX_URL = process.env['RESULTS_INDEX_URL'];
+
+    if (!RESULTS_INDEX_URL) {
+      console.warn('[RESULTS_INDEX_WRITE] skipped — RESULTS_INDEX_URL missing');
+    } else {
+      fetch(`${RESULTS_INDEX_URL}/api/v1/runs`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${process.env['PLATFORM_API_KEY']}`,
+        },
+        body: JSON.stringify({
+          execution_id: orchestrationResult.executionId,
+          simulation_id: orchestrationResult.result?.simulationId,
+          metadata: orchestrationResult.result?.metadata ?? {},
+          execution_proof: orchestrationResult.result?.executionProof,
+          environment: process.env['ENVIRONMENT'] ?? 'production',
+        }),
+      })
+        .then(() => console.log('[RESULTS_INDEX_WRITE] success'))
+        .catch((err: unknown) => console.error('[RESULTS_INDEX_WRITE] failed', err));
+    }
 
     // Return with ruvector-minted execution_id
     sendSimulateSuccess(res, orchestrationResult.result, orchestrationResult.executionId);
