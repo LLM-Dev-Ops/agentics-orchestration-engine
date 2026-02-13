@@ -519,7 +519,7 @@ function writeResultsIndex(
   const payload = {
     execution_id: executionId,
     simulation_id: simulationId,
-    environment: 'production',
+    environment: process.env['AGENTICS_ENV'] || 'simulation',
     metadata: {
       execution_id: executionId,
       simulation_id: simulationId,
