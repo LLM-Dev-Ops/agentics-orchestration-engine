@@ -742,8 +742,11 @@ async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promi
     payload: body,
   };
 
+  const publishUrl = `${ruvectorEndpoint}/events/decisions`;
+  console.log(`[orchestration] publishing to ${publishUrl}`);
+
   try {
-    const publishResponse = await fetch(`${ruvectorEndpoint}/events/decisions`, {
+    const publishResponse = await fetch(publishUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(decisionEvent),
