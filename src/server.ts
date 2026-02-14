@@ -699,8 +699,8 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 /**
  * POST /api/v1/runs — Create a new orchestration run.
  *
- * Accepts any JSON body, generates a runId, logs the request,
- * and returns 202 with { runId, status: "accepted" }.
+ * Generates a runId, publishes a plan_approved decision to Ruvector
+ * so the execution engine listener picks it up, and returns 202.
  */
 async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== 'POST') {
@@ -724,6 +724,37 @@ async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promi
   const runId = `run-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
   console.log(`[POST /api/v1/runs] runId=${runId}`, JSON.stringify(body));
+
+  // Publish plan_approved decision to Ruvector so the execution listener reacts
+  const ruvectorEndpoint = process.env['RUVECTOR_ENDPOINT'] ?? 'http://localhost:8081';
+  const decisionEvent = {
+    type: 'plan_approved',
+    runId,
+    source: 'orchestration',
+    timestamp: new Date().toISOString(),
+    payload: body,
+  };
+
+  try {
+    const publishResponse = await fetch(`${ruvectorEndpoint}/events/decisions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(decisionEvent),
+    });
+
+    if (!publishResponse.ok) {
+      const detail = `${publishResponse.status} ${publishResponse.statusText}`;
+      console.error(`[orchestration] failed to publish plan_approved for runId=${runId}: ${detail}`);
+      sendGenericError(res, 500, 'RUVECTOR_PUBLISH_FAILED', `Failed to publish decision: ${detail}`);
+      return;
+    }
+
+    console.log(`[orchestration] published plan_approved for runId=${runId}`);
+  } catch (error) {
+    console.error(`[orchestration] failed to publish plan_approved for runId=${runId}:`, error);
+    sendGenericError(res, 500, 'RUVECTOR_PUBLISH_FAILED', error instanceof Error ? error.message : 'Failed to publish decision to Ruvector');
+    return;
+  }
 
   const response: RunCreateResponse = { runId, status: 'accepted' };
   _sendJsonInternal(res, 202, response);
