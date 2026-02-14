@@ -14,10 +14,8 @@ import type { SimulationId, ExecutionId, ISOTimestamp, SpanId, TraceId } from '.
  */
 export interface ExecutionAcceptanceRequest {
   readonly simulation_id: SimulationId;
-  readonly plan_id?: string;
   readonly source: string;
-  readonly timestamp: ISOTimestamp;
-  readonly scenario_metadata: {
+  readonly scenario: {
     readonly scenario_id: string;
     readonly name: string;
     readonly category: string;

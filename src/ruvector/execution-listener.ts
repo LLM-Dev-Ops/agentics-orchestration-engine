@@ -43,8 +43,9 @@ import type {
   SimulationExecutionCompletedEvent,
   SimulationExecutionFailedEvent,
   PlanId,
+  RuvectorEventId,
 } from './types.js';
-import { isPlanApprovedEvent, isExecutableEvent } from './types.js';
+import { isPlanApprovedEvent, isExecutableEvent, createRuvectorEventId } from './types.js';
 
 // ============================================================================
 // SIMULATION RESOLVER INTERFACE
@@ -248,8 +249,23 @@ export class ExecutionListener {
       return;
     }
 
+    // Ensure event_id is present (generate if missing from upstream)
+    const event_id: RuvectorEventId = event.event_id ?? createRuvectorEventId(`evt-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`);
+
+    // ADR-004 invariant 1: all identifiers MUST be defined before emission
+    if (!simulation_id || !plan_id || !event_id) {
+      console.error('[ExecutionListener] Missing identifiers — abort emit', {
+        event_id,
+        plan_id,
+        simulation_id,
+        type,
+      });
+      return;
+    }
+
     const normalizedEvent: PlanApprovedEvent = {
       ...event,
+      event_id,
       type: 'plan_approved',
       plan_id,
       simulation_id,

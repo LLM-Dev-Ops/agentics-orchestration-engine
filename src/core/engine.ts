@@ -430,29 +430,28 @@ export class OrchestrationEngine {
   private async requestRuvectorAcceptance(
     config: OrchestrationConfig
   ): Promise<ExecutionAcceptanceResponse> {
-    const request: ExecutionAcceptanceRequest = {
+    // ADR-004 compliant decision envelope — no scenario payload, no steps, no config
+    const acceptancePayload = {
       simulation_id: config.simulationId,
-      source: config.engineId,
-      timestamp: new Date().toISOString() as ISOTimestamp,
-      scenario_metadata: {
-        scenario_id: config.scenario.scenarioId as string,
-        name: config.scenario.name,
-        category: config.scenario.category,
-        step_count: config.scenario.steps.length,
+      plan_id: config.simulation_resolution ?? config.simulationId,
+      simulation_resolution: config.simulation_resolution ?? 'aggregate',
+      execution_metadata: {
+        source: 'agentics-simulation-engine',
+        environment: process.env['NODE_ENV'] ?? 'production',
+        timestamp: new Date().toISOString(),
       },
     };
 
-    console.log('[OrchestrationEngine] Requesting ruvector execution acceptance', {
-      simulation_id: config.simulationId,
-      source: config.engineId,
-    });
+    console.log('[RuvectorAcceptance] payload:', JSON.stringify(acceptancePayload));
 
     if (!this.ruvectorClient) {
       throw new OrchestrationError('Ruvector client not initialized', 'NO_RUVECTOR_CLIENT', 'Cannot request acceptance without ruvector client');
     }
 
     try {
-      const response = await this.ruvectorClient.requestExecutionAcceptance(request);
+      const response = await this.ruvectorClient.requestExecutionAcceptance(
+        acceptancePayload as unknown as ExecutionAcceptanceRequest
+      );
       return response;
     } catch (error) {
       throw new OrchestrationError(

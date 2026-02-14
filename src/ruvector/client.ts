@@ -275,7 +275,6 @@ export class RuvectorClient {
 
     console.log('[RuvectorClient] Requesting execution acceptance', {
       simulation_id: request.simulation_id,
-      plan_id: request.plan_id,
       source: request.source,
     });
 
@@ -285,7 +284,7 @@ export class RuvectorClient {
 
     try {
       const response = await fetch(
-        `${this.config.endpoint}/executions/accept`,
+        `${this.config.endpoint}/v1/accept`,
         {
           method: 'POST',
           headers: {
@@ -448,9 +447,48 @@ export class RuvectorClient {
   }
 
   /**
+   * Normalizes a raw API event into a proper DecisionEvent.
+   *
+   * The Ruvector API may return events with identifiers nested inside
+   * a `payload` sub-object. This method extracts them to top-level
+   * fields and generates `event_id` if missing.
+   */
+  private normalizeRawEvent(raw: Record<string, unknown>): DecisionEvent {
+    console.log('[RuvectorClient] Raw event before parsing:', JSON.stringify(raw));
+
+    // Unwrap envelope: ruvector may nest the real event under payload, data, or send flat
+    const event = (raw['payload'] ?? raw['data'] ?? raw) as Record<string, unknown>;
+
+    const event_id = (event['event_id'] ?? raw['event_id'] ?? createRuvectorEventId(`evt-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`)) as RuvectorEventId;
+    const plan_id = event['plan_id'] ?? raw['plan_id'];
+    const simulation_id = event['simulation_id'] ?? raw['simulation_id'];
+    const type = (event['type'] ?? raw['type']) as string;
+    const timestamp = (event['timestamp'] ?? raw['timestamp'] ?? new Date().toISOString()) as ISOTimestamp;
+    const source = event['source'] ?? raw['source'];
+    const correlation_id = event['correlation_id'] ?? raw['correlation_id'];
+    const execution_profile = event['execution_profile'] ?? raw['execution_profile'];
+    const advisory = event['advisory'] ?? raw['advisory'];
+
+    return {
+      event_id,
+      type,
+      plan_id,
+      simulation_id,
+      timestamp,
+      ...(source !== undefined && { source }),
+      ...(correlation_id !== undefined && { correlation_id }),
+      ...(execution_profile !== undefined && { execution_profile }),
+      ...(advisory !== undefined && { advisory }),
+    } as DecisionEvent;
+  }
+
+  /**
    * Handles an incoming decision event.
    */
-  private async handleEvent(event: DecisionEvent): Promise<void> {
+  private async handleEvent(rawEvent: DecisionEvent): Promise<void> {
+    // Normalize: extract identifiers from payload if nested, generate event_id if missing
+    const event = this.normalizeRawEvent(rawEvent as unknown as Record<string, unknown>);
+
     this.lastEventId = event.event_id;
     this.updateStatus({
       eventsReceived: this.status.eventsReceived + 1,
@@ -462,6 +500,13 @@ export class RuvectorClient {
       plan_id: event.plan_id,
       simulation_id: event.simulation_id,
     });
+
+    // Guard: reject events with missing identifiers before dispatching
+    if (!event.plan_id || !event.simulation_id) {
+      console.error('[RuvectorAcceptance] invalid event envelope', rawEvent);
+      this.updateStatus({ errors: this.status.errors + 1 });
+      return;
+    }
 
     // Notify all listeners
     for (const listener of this.eventListeners) {

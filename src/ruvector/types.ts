@@ -321,14 +321,10 @@ export interface RuvectorConnectionStatus {
 export interface ExecutionAcceptanceRequest {
   /** The scenario being submitted for execution */
   readonly simulation_id: SimulationId;
-  /** Plan that triggered this execution (if event-driven) */
-  readonly plan_id?: PlanId;
   /** Requesting engine identifier */
   readonly source: string;
-  /** Request timestamp */
-  readonly timestamp: ISOTimestamp;
-  /** Scenario metadata for ruvector to evaluate */
-  readonly scenario_metadata: {
+  /** Scenario object for ruvector to evaluate */
+  readonly scenario: {
     readonly scenario_id: string;
     readonly name: string;
     readonly category: string;
