@@ -76,28 +76,10 @@ interface HealthResponse {
   mode: string | undefined;
 }
 
-interface RunCreateRequest {
-  scenario: Scenario;
-  config?: Partial<SimulationConfig>;
-}
-
 interface RunCreateResponse {
   runId: string;
   status: 'accepted';
 }
-
-interface RunState {
-  runId: string;
-  status: 'accepted' | 'running' | 'completed' | 'failed';
-  executionId?: string;
-  simulationId?: string;
-  createdAt: string;
-  result?: SimulationResult;
-  error?: { code: string; message: string };
-}
-
-/** In-memory run store for tracking orchestration state */
-const runStore = new Map<string, RunState>();
 
 interface ExecutionMetadata {
   service: string;
@@ -717,7 +699,8 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 /**
  * POST /api/v1/runs — Create a new orchestration run.
  *
- * Validates the request body, kicks off orchestration, and returns a runId.
+ * Accepts any JSON body, generates a runId, logs the request,
+ * and returns 202 with { runId, status: "accepted" }.
  */
 async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== 'POST') {
@@ -733,89 +716,25 @@ async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
 
-  // Basic structure check
   if (!body || typeof body !== 'object') {
     sendGenericError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
     return;
   }
 
-  const raw = body as Record<string, unknown>;
-  if (!raw['scenario'] || typeof raw['scenario'] !== 'object') {
-    sendGenericError(res, 400, 'MISSING_SCENARIO', 'Request body must include a "scenario" object');
-    return;
-  }
-
-  const normalizedBody = normalizeRequest(body) as RunCreateRequest;
-  const scenario = normalizedBody.scenario;
-
   const runId = `run-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
-  // Store initial state
-  const runState: RunState = {
-    runId,
-    status: 'accepted',
-    createdAt: new Date().toISOString(),
-  };
-  runStore.set(runId, runState);
-
-  // Kick off orchestration asynchronously, update run state on completion
-  const simConfig = normalizedBody.config
-    ? { ...createDefaultConfig(scenario), ...normalizedBody.config }
-    : createDefaultConfig(scenario);
-
-  const ruvectorClient = createRuvectorClientFromEnv();
-  const coreClients = createMockCoreClientRegistry();
-  const engine = createOrchestrationEngine();
-  engine.initialize(ruvectorClient, coreClients);
-
-  const orchestrationConfig: OrchestrationConfig = {
-    simulationId: simConfig.simulationId,
-    simulationConfig: simConfig,
-    scenario,
-    engineId: SERVICE_INSTANCE_ID,
-  };
-
-  // Update state to running and begin orchestration
-  runStore.set(runId, { ...runState, status: 'running', simulationId: simConfig.simulationId });
-
-  engine.orchestrate(orchestrationConfig).then(
-    (result) => {
-      runStore.set(runId, {
-        runId,
-        status: 'completed',
-        executionId: result.executionId,
-        simulationId: result.result.simulationId,
-        createdAt: runState.createdAt,
-        result: result.result,
-      });
-    },
-    (error) => {
-      runStore.set(runId, {
-        runId,
-        status: 'failed',
-        createdAt: runState.createdAt,
-        error: {
-          code: error instanceof OrchestrationError ? error.code : 'ORCHESTRATION_ERROR',
-          message: error instanceof Error ? error.message : String(error),
-        },
-      });
-    }
-  );
+  console.log(`[POST /api/v1/runs] runId=${runId}`, JSON.stringify(body));
 
   const response: RunCreateResponse = { runId, status: 'accepted' };
   _sendJsonInternal(res, 202, response);
 }
 
 /**
- * GET /api/v1/runs/:id — Retrieve current orchestration state for a run.
+ * GET /api/v1/runs/:id — Placeholder for run state retrieval.
+ * No persistence yet — always returns { runId, status: "pending" }.
  */
 function handleGetRun(res: ServerResponse, runId: string): void {
-  const runState = runStore.get(runId);
-  if (!runState) {
-    sendGenericError(res, 404, 'RUN_NOT_FOUND', `No run found with id: ${runId}`);
-    return;
-  }
-  _sendJsonInternal(res, 200, runState);
+  _sendJsonInternal(res, 200, { runId, status: 'pending' });
 }
 
 // ============================================================================

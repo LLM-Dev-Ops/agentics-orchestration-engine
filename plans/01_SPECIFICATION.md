@@ -1167,7 +1167,7 @@ $ agentics-sim reproduce --simulation-id sim-2024-q4-001
 
 Fetching simulation manifest...
   Scenario: procurement-optimization-2024-q4 v1.2.0
-  Engine: agentics-simulation-engine:v3.4.2
+  Engine: agentics-orchestration-engine:v3.4.2
   Policy: policy-snapshot-2024-10-15-001
 
 Restoring baseline data...

@@ -251,7 +251,7 @@ export class OrchestrationEngine {
     this.rootSpan = new TraceSpan('orchestration.delegate', 'orchestration-engine', {
       traceId: this.traceId,
       parentSpanId: this.rootSpanId,
-      repo_name: 'agentics-simulation-engine',
+      repo_name: 'agentics-orchestration-engine',
       attributes: {
         'execution.id': this.executionId,
         'simulation.id': config.simulationId,
@@ -436,7 +436,7 @@ export class OrchestrationEngine {
       plan_id: config.simulation_resolution ?? config.simulationId,
       simulation_resolution: config.simulation_resolution ?? 'aggregate',
       execution_metadata: {
-        source: 'agentics-simulation-engine',
+        source: 'agentics-orchestration-engine',
         environment: process.env['NODE_ENV'] ?? 'production',
         timestamp: new Date().toISOString(),
       },

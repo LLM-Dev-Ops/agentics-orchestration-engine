@@ -78,7 +78,7 @@ export function createContractViolationResponse(errors: ReadonlyArray<ContractVa
       },
     },
     execution_metadata: {
-      service: 'agentics-simulation-engine',
+      service: 'agentics-orchestration-engine',
       version: '0.1.0',
       timestamp: new Date().toISOString(),
       simulation_id: null,

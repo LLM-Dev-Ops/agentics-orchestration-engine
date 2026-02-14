@@ -89,8 +89,8 @@ This repo deploys as a **single Docker image with two entry points** on Google C
 
 | Service | Cloud Run Name | Entry Point | Role |
 |---------|---------------|-------------|------|
-| HTTP API | `agentics-simulation-engine` | `node dist/server.js` | Handles REST requests, validates contracts, orchestrates via Ruvector |
-| Event Listener | `agentics-simulation-engine-listener` | `node dist/ruvector/startup.js` | Subscribes to `plan_approved` events, triggers orchestration |
+| HTTP API | `agentics-orchestration-engine` | `node dist/server.js` | Handles REST requests, validates contracts, orchestrates via Ruvector |
+| Event Listener | `agentics-orchestration-engine-listener` | `node dist/ruvector/startup.js` | Subscribes to `plan_approved` events, triggers orchestration |
 
 ## Quick Start
 
@@ -290,7 +290,7 @@ packages/
 gcloud config set project agentics-dev
 
 # Deploy HTTP API
-gcloud run deploy agentics-simulation-engine \
+gcloud run deploy agentics-orchestration-engine \
   --source . \
   --region us-central1 \
   --platform managed \
@@ -301,7 +301,7 @@ gcloud run deploy agentics-simulation-engine \
   --port 8080
 
 # Deploy Event Listener
-gcloud run deploy agentics-simulation-engine-listener \
+gcloud run deploy agentics-orchestration-engine-listener \
   --source . \
   --region us-central1 \
   --platform managed \
@@ -316,7 +316,7 @@ gcloud run deploy agentics-simulation-engine-listener \
 
 | Environment | URL |
 |-------------|-----|
-| Development | `https://agentics-simulation-engine-1062287243982.us-central1.run.app` |
+| Development | `https://agentics-orchestration-engine-1062287243982.us-central1.run.app` |
 
 ## Development
 

@@ -12,8 +12,8 @@ This repository produces **TWO separate Cloud Run services** from a single codeb
 
 | Service | Name | Purpose | Entry Point |
 |---------|------|---------|-------------|
-| **A** | `agentics-simulation-engine` | HTTP/RPC simulation execution API | `node dist/server.js` |
-| **B** | `agentics-simulation-engine-listener` | Event-driven execution trigger | `node dist/ruvector/startup.js` |
+| **A** | `agentics-orchestration-engine` | HTTP/RPC simulation execution API | `node dist/server.js` |
+| **B** | `agentics-orchestration-engine-listener` | Event-driven execution trigger | `node dist/ruvector/startup.js` |
 
 ### Shared Resources
 - Same container image
@@ -59,12 +59,12 @@ Simulate endpoint: POST http://localhost:8080/v1/simulate
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: agentics-simulation-engine
+  name: agentics-orchestration-engine
 spec:
   template:
     spec:
       containers:
-        - image: gcr.io/PROJECT_ID/agentics-simulation-engine:TAG
+        - image: gcr.io/PROJECT_ID/agentics-orchestration-engine:TAG
           command: ["node"]
           args: ["dist/server.js"]
           ports:
@@ -137,7 +137,7 @@ Press Ctrl+C to stop
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: agentics-simulation-engine-listener
+  name: agentics-orchestration-engine-listener
 spec:
   template:
     metadata:
@@ -148,7 +148,7 @@ spec:
       # Increase timeout for long-running process
       timeoutSeconds: 3600
       containers:
-        - image: gcr.io/PROJECT_ID/agentics-simulation-engine:TAG
+        - image: gcr.io/PROJECT_ID/agentics-orchestration-engine:TAG
           command: ["node"]
           args: ["dist/ruvector/startup.js"]
 ```
@@ -157,14 +157,14 @@ spec:
 
 ## Environment Variable Matrix
 
-### API Service (`agentics-simulation-engine`)
+### API Service (`agentics-orchestration-engine`)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `PORT` | No | `8080` | HTTP server port |
 | `NODE_ENV` | No | `production` | Node environment |
 
-### Listener Service (`agentics-simulation-engine-listener`)
+### Listener Service (`agentics-orchestration-engine-listener`)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -257,7 +257,7 @@ ERROR: Failed to create execution listener: RuvectorClientError: Secret not foun
 ```bash
 # Grant the Cloud Run service account access to secrets
 gcloud secrets add-iam-policy-binding ruvector-api-key \
-  --member="serviceAccount:agentics-simulation-engine-listener@PROJECT_ID.iam.gserviceaccount.com" \
+  --member="serviceAccount:agentics-orchestration-engine-listener@PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
 ```
 
@@ -330,8 +330,8 @@ CMD ["node", "dist/server.js"]
 
 ### Build Command
 ```bash
-docker build -t gcr.io/PROJECT_ID/agentics-simulation-engine:TAG .
-docker push gcr.io/PROJECT_ID/agentics-simulation-engine:TAG
+docker build -t gcr.io/PROJECT_ID/agentics-orchestration-engine:TAG .
+docker push gcr.io/PROJECT_ID/agentics-orchestration-engine:TAG
 ```
 
 ---
@@ -355,8 +355,8 @@ Before deployment, verify:
 ## Confirmation
 
 **Two-Service Architecture:** ✅ Confirmed
-- Service A: `agentics-simulation-engine` (API)
-- Service B: `agentics-simulation-engine-listener` (Event listener)
+- Service A: `agentics-orchestration-engine` (API)
+- Service B: `agentics-orchestration-engine-listener` (Event listener)
 
 **Entrypoints Defined:** ✅ Confirmed
 - API: `node dist/server.js`

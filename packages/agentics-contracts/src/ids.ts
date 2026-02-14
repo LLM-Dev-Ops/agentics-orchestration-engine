@@ -61,7 +61,7 @@ export type CorrelationId = Brand<string, 'CorrelationId'>;
 /**
  * Canonical execution identifier minted by ruvector-service.
  * This is the ONLY valid execution ID in the system.
- * agentics-simulation-engine MUST NOT mint this - it comes from ruvector.
+ * agentics-orchestration-engine MUST NOT mint this - it comes from ruvector.
  */
 export type ExecutionId = Brand<string, 'ExecutionId'>;
 

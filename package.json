@@ -1,7 +1,7 @@
 {
-  "name": "@agentics/simulation-engine",
+  "name": "@agentics/orchestration-engine",
   "version": "0.1.0",
-  "description": "Deterministic enterprise decision simulation engine",
+  "description": "Agentics orchestration engine — Layer 4 conductor service",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
