@@ -69,11 +69,35 @@ interface SimulateRequest {
 }
 
 interface HealthResponse {
-  status: 'healthy' | 'unhealthy';
+  service: string;
   version: string;
-  timestamp: string;
-  mode: 'orchestration';
+  status: 'healthy' | 'unhealthy';
+  role: string | undefined;
+  mode: string | undefined;
 }
+
+interface RunCreateRequest {
+  scenario: Scenario;
+  config?: Partial<SimulationConfig>;
+}
+
+interface RunCreateResponse {
+  runId: string;
+  status: 'accepted';
+}
+
+interface RunState {
+  runId: string;
+  status: 'accepted' | 'running' | 'completed' | 'failed';
+  executionId?: string;
+  simulationId?: string;
+  createdAt: string;
+  result?: SimulationResult;
+  error?: { code: string; message: string };
+}
+
+/** In-memory run store for tracking orchestration state */
+const runStore = new Map<string, RunState>();
 
 interface ExecutionMetadata {
   service: string;
@@ -530,10 +554,11 @@ function createRuvectorClientFromEnv(): RuvectorClient {
 
 function handleHealth(res: ServerResponse): void {
   const health: HealthResponse = {
-    status: 'healthy',
+    service: SERVICE_NAME,
     version: SERVICE_VERSION,
-    timestamp: new Date().toISOString(),
-    mode: 'orchestration',
+    status: 'healthy',
+    role: process.env['AGENTICS_ROLE'],
+    mode: process.env['AGENTICS_MODE'],
   };
   _sendJsonInternal(res, 200, health);
 }
@@ -686,6 +711,114 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 }
 
 // ============================================================================
+// RUN ENDPOINTS
+// ============================================================================
+
+/**
+ * POST /api/v1/runs — Create a new orchestration run.
+ *
+ * Validates the request body, kicks off orchestration, and returns a runId.
+ */
+async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== 'POST') {
+    sendGenericError(res, 405, 'METHOD_NOT_ALLOWED', 'Only POST method is allowed');
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody<unknown>(req);
+  } catch (error) {
+    sendGenericError(res, 400, 'INVALID_BODY', error instanceof Error ? error.message : 'Failed to parse request body');
+    return;
+  }
+
+  // Basic structure check
+  if (!body || typeof body !== 'object') {
+    sendGenericError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+    return;
+  }
+
+  const raw = body as Record<string, unknown>;
+  if (!raw['scenario'] || typeof raw['scenario'] !== 'object') {
+    sendGenericError(res, 400, 'MISSING_SCENARIO', 'Request body must include a "scenario" object');
+    return;
+  }
+
+  const normalizedBody = normalizeRequest(body) as RunCreateRequest;
+  const scenario = normalizedBody.scenario;
+
+  const runId = `run-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+
+  // Store initial state
+  const runState: RunState = {
+    runId,
+    status: 'accepted',
+    createdAt: new Date().toISOString(),
+  };
+  runStore.set(runId, runState);
+
+  // Kick off orchestration asynchronously, update run state on completion
+  const simConfig = normalizedBody.config
+    ? { ...createDefaultConfig(scenario), ...normalizedBody.config }
+    : createDefaultConfig(scenario);
+
+  const ruvectorClient = createRuvectorClientFromEnv();
+  const coreClients = createMockCoreClientRegistry();
+  const engine = createOrchestrationEngine();
+  engine.initialize(ruvectorClient, coreClients);
+
+  const orchestrationConfig: OrchestrationConfig = {
+    simulationId: simConfig.simulationId,
+    simulationConfig: simConfig,
+    scenario,
+    engineId: SERVICE_INSTANCE_ID,
+  };
+
+  // Update state to running and begin orchestration
+  runStore.set(runId, { ...runState, status: 'running', simulationId: simConfig.simulationId });
+
+  engine.orchestrate(orchestrationConfig).then(
+    (result) => {
+      runStore.set(runId, {
+        runId,
+        status: 'completed',
+        executionId: result.executionId,
+        simulationId: result.result.simulationId,
+        createdAt: runState.createdAt,
+        result: result.result,
+      });
+    },
+    (error) => {
+      runStore.set(runId, {
+        runId,
+        status: 'failed',
+        createdAt: runState.createdAt,
+        error: {
+          code: error instanceof OrchestrationError ? error.code : 'ORCHESTRATION_ERROR',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  );
+
+  const response: RunCreateResponse = { runId, status: 'accepted' };
+  _sendJsonInternal(res, 202, response);
+}
+
+/**
+ * GET /api/v1/runs/:id — Retrieve current orchestration state for a run.
+ */
+function handleGetRun(res: ServerResponse, runId: string): void {
+  const runState = runStore.get(runId);
+  if (!runState) {
+    sendGenericError(res, 404, 'RUN_NOT_FOUND', `No run found with id: ${runId}`);
+    return;
+  }
+  _sendJsonInternal(res, 200, runState);
+}
+
+// ============================================================================
 // REQUEST ROUTER
 // ============================================================================
 
@@ -715,9 +848,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // Match /api/v1/runs/:id
+  const runsIdMatch = path.match(/^\/api\/v1\/runs\/([^/]+)$/);
+
   try {
     switch (path) {
-      case '/':
       case '/health':
       case '/healthz':
         handleHealth(res);
@@ -727,8 +862,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         await handleSimulate(req, res);
         break;
 
+      case '/api/v1/runs':
+        await handleCreateRun(req, res);
+        break;
+
       default:
-        if (isSimulatePath(path)) {
+        if (runsIdMatch && req.method === 'GET') {
+          handleGetRun(res, runsIdMatch[1]!);
+        } else if (isSimulatePath(path)) {
           sendSimulateError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`, 'routing');
         } else {
           sendGenericError(res, 404, 'NOT_FOUND', `Endpoint not found: ${path}`);
@@ -772,10 +913,16 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Agentics Orchestration Engine listening on port ${PORT}`);
-  console.log(`Mode: orchestration-only (conductor, not engine)`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Simulate endpoint: POST http://localhost:${PORT}/v1/simulate`);
+  console.log(`SERVICE_NAME=${SERVICE_NAME}`);
+  console.log(`SERVICE_VERSION=${SERVICE_VERSION}`);
+  console.log(`AGENTICS_ROLE=${process.env['AGENTICS_ROLE'] ?? 'orchestrator'}`);
+  console.log(`AGENTICS_MODE=${process.env['AGENTICS_MODE'] ?? 'orchestration'}`);
+  console.log(`Listening on port ${PORT}`);
+  console.log(`Routes:`);
+  console.log(`  GET  /health`);
+  console.log(`  POST /v1/simulate`);
+  console.log(`  POST /api/v1/runs`);
+  console.log(`  GET  /api/v1/runs/:id`);
 });
 
 process.on('SIGTERM', () => {
