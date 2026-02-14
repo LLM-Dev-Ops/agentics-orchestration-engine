@@ -516,10 +516,13 @@ function createDefaultConfig(scenario: Scenario): SimulationConfig {
 
 /**
  * Creates a RuvectorClient from environment variables.
- * Falls back to a mock configuration for development.
+ * Fails fast if RUVECTOR_SERVICE_URL is not set.
  */
 function createRuvectorClientFromEnv(): RuvectorClient {
-  const endpoint = process.env['RUVECTOR_ENDPOINT'] ?? 'http://localhost:8081';
+  const endpoint = process.env['RUVECTOR_SERVICE_URL'];
+  if (!endpoint) {
+    throw new Error('RUVECTOR_SERVICE_URL is not defined');
+  }
   const config: RuvectorClientConfig = {
     endpoint,
     credentialsRef: process.env['RUVECTOR_CREDENTIALS_REF'] ?? 'ruvector-api-key',
@@ -726,7 +729,11 @@ async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promi
   console.log(`[POST /api/v1/runs] runId=${runId}`, JSON.stringify(body));
 
   // Publish plan_approved decision to Ruvector so the execution listener reacts
-  const ruvectorEndpoint = process.env['RUVECTOR_ENDPOINT'] ?? 'http://localhost:8081';
+  const ruvectorEndpoint = process.env['RUVECTOR_SERVICE_URL'];
+  if (!ruvectorEndpoint) {
+    sendGenericError(res, 500, 'RUVECTOR_NOT_CONFIGURED', 'RUVECTOR_SERVICE_URL is not defined');
+    return;
+  }
   const decisionEvent = {
     type: 'plan_approved',
     runId,
@@ -867,6 +874,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`SERVICE_VERSION=${SERVICE_VERSION}`);
   console.log(`AGENTICS_ROLE=${process.env['AGENTICS_ROLE'] ?? 'orchestrator'}`);
   console.log(`AGENTICS_MODE=${process.env['AGENTICS_MODE'] ?? 'orchestration'}`);
+  console.log(`Using RUVECTOR_SERVICE_URL: ${process.env['RUVECTOR_SERVICE_URL'] ?? '(NOT SET — will fail at runtime)'}`);
   console.log(`Listening on port ${PORT}`);
   console.log(`Routes:`);
   console.log(`  GET  /health`);
