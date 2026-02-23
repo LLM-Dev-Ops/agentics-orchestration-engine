@@ -13,6 +13,7 @@ export * from './trace.js';
 export * from './artifact.js';
 export * from './ruvector.js';
 export * from './result-packet.js';
+export * from './pipeline.js';
 export {
   validateSimulateRequest,
   validateResultPacket,
