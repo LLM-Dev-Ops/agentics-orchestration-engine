@@ -16,7 +16,8 @@
     "test:unit": "vitest run test/unit",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
-    "validate": "npm run typecheck && npm run lint && npm run test"
+    "check:no-mock-cores": "node scripts/check-no-mock-cores.mjs",
+    "validate": "npm run typecheck && npm run lint && npm run check:no-mock-cores && npm run test"
   },
   "keywords": [
     "simulation",

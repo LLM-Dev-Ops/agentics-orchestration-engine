@@ -20,6 +20,7 @@ import {
 import { createSimulationId, createScenarioId, createISOTimestamp } from '../../../src/types/common.js';
 import type { SimulationConfig, SimulationId } from '../../../src/types/simulation.js';
 import type { Scenario } from '../../../src/types/scenario.js';
+import { createMockCoreClientRegistry } from '../../../src/integration/cores/mock-cores.js';
 
 // ============================================================================
 // TEST FIXTURES
@@ -28,6 +29,10 @@ import type { Scenario } from '../../../src/types/scenario.js';
 const mockSecretManager: SecretManager = {
   getSecret: vi.fn().mockResolvedValue('test-api-key'),
 };
+
+// Core clients are an explicit constructor dependency: production builds them
+// from environment configuration and fails closed, tests inject doubles.
+const testCoreClients = createMockCoreClientRegistry();
 
 const createTestConfig = (): ExecutionListenerConfig => ({
   ruvector: {
@@ -205,14 +210,14 @@ describe('ExecutionListener', () => {
   });
 
   it('should create listener with configuration', () => {
-    const listener = createExecutionListener(config, resolver, mockSecretManager);
+    const listener = createExecutionListener(config, resolver, testCoreClients, mockSecretManager);
 
     expect(listener).toBeDefined();
     expect(listener.getStatus().running).toBe(false);
   });
 
   it('should track execution events through listeners', () => {
-    const listener = createExecutionListener(config, resolver, mockSecretManager);
+    const listener = createExecutionListener(config, resolver, testCoreClients, mockSecretManager);
     const events: { type: string; planId: string }[] = [];
 
     listener.onExecutionEvent((event) => {
@@ -225,7 +230,7 @@ describe('ExecutionListener', () => {
   });
 
   it('should provide status information', () => {
-    const listener = createExecutionListener(config, resolver, mockSecretManager);
+    const listener = createExecutionListener(config, resolver, testCoreClients, mockSecretManager);
     const status = listener.getStatus();
 
     expect(status.running).toBe(false);
@@ -238,7 +243,7 @@ describe('ExecutionListener', () => {
   });
 
   it('should provide idempotency statistics', () => {
-    const listener = createExecutionListener(config, resolver, mockSecretManager);
+    const listener = createExecutionListener(config, resolver, testCoreClients, mockSecretManager);
     const stats = listener.getIdempotencyStatistics();
 
     expect(stats.total).toBe(0);

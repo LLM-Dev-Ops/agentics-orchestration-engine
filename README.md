@@ -217,6 +217,32 @@ Content-Type: application/json
 }
 ```
 
+### Submit Run Intent
+
+```
+POST /api/v1/runs
+Content-Type: application/json
+```
+
+Forwards the intent to Ruvector's `/v1/accept` and returns the Ruvector-minted
+identity. This service mints no identity and declares no plan approved
+(agentics-enforcement ADR-004).
+
+**Request:**
+```json
+{ "simulation_id": "sim-abc123", "plan_id": "plan-1", "simulation_resolution": "aggregate" }
+```
+
+**Accepted (202):**
+```json
+{ "execution_id": "exec-ruvector-minted-id", "status": "accepted", "simulation_resolution": "aggregate" }
+```
+
+> **Breaking change (ADR-0001).** This endpoint previously returned a locally
+> minted `runId` and published a synthetic `plan_approved` event to Ruvector.
+> It now returns Ruvector's `execution_id` and publishes nothing. Callers
+> reading `runId` from the 202 body must be updated.
+
 ## Orchestration Flow
 
 1. **Contract validation** -- Request validated against JSON schema (fail-fast)
@@ -242,7 +268,17 @@ Content-Type: application/json
 | `RUVECTOR_ENDPOINT` | No | `http://localhost:8081` | Ruvector API endpoint |
 | `RUVECTOR_CREDENTIALS_REF` | No | `ruvector-api-key` | Secret Manager reference |
 | `RESULTS_INDEX_URL` | No | -- | URL for persisting results |
-| `PLATFORM_API_KEY` | No | -- | API key for results-index |
+| `PLATFORM_API_KEY` | No | -- | API key for results-index and Cores |
+| `SECURITY_CORE_URL` | **Yes** | -- | LLM-Security-Core base URL |
+| `DATA_CORE_URL` | **Yes** | -- | LLM-Data-Core base URL |
+| `GOVERNANCE_CORE_URL` | **Yes** | -- | LLM-Governance-Core base URL |
+| `AUTOMATION_CORE_URL` | **Yes** | -- | LLM-Automation-Core base URL |
+| `CORE_REQUEST_TIMEOUT_MS` | No | `30000` | Per-Core request timeout |
+
+The four `*_CORE_URL` variables are **fail closed** (ADR-0001): the process exits
+with a non-zero status naming the missing variable rather than starting up and
+delegating to mocks. There is no mock fallback in any server-reachable path —
+`npm run check:no-mock-cores` enforces this.
 
 ### Event Listener Service
 

@@ -21,7 +21,7 @@ import {
   type OrchestrationResult,
 } from '../core/engine.js';
 import type { CoreClientRegistry } from '../integration/cores/core-client.js';
-import { createMockCoreClientRegistry } from '../integration/cores/mock-cores.js';
+import { createCoreClientRegistryFromEnv } from '../integration/cores/http-cores.js';
 import {
   RuvectorClient,
   createRuvectorClient,
@@ -135,12 +135,12 @@ export class ExecutionListener {
   constructor(
     config: ExecutionListenerConfig,
     simulationResolver: SimulationResolver,
-    secretManager?: SecretManager,
-    coreClients?: CoreClientRegistry
+    coreClients: CoreClientRegistry,
+    secretManager?: SecretManager
   ) {
     this.config = config;
     this.simulationResolver = simulationResolver;
-    this.coreClients = coreClients ?? createMockCoreClientRegistry();
+    this.coreClients = coreClients;
     this.ruvectorClient = createRuvectorClient(config.ruvector, secretManager);
     this.idempotencyGuard = createIdempotencyGuard(config.idempotency);
   }
@@ -568,9 +568,10 @@ export class ExecutionListener {
 export function createExecutionListener(
   config: ExecutionListenerConfig,
   simulationResolver: SimulationResolver,
+  coreClients: CoreClientRegistry,
   secretManager?: SecretManager
 ): ExecutionListener {
-  return new ExecutionListener(config, simulationResolver, secretManager);
+  return new ExecutionListener(config, simulationResolver, coreClients, secretManager);
 }
 
 export function createExecutionListenerFromEnvironment(
@@ -586,7 +587,12 @@ export function createExecutionListenerFromEnvironment(
     maxConcurrentExecutions: parseInt(process.env['MAX_CONCURRENT_EXECUTIONS'] ?? '5', 10),
   };
 
-  return createExecutionListener(config, simulationResolver, secretManager);
+  return createExecutionListener(
+    config,
+    simulationResolver,
+    createCoreClientRegistryFromEnv(),
+    secretManager
+  );
 }
 
 // ============================================================================
