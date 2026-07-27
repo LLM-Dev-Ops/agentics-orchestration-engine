@@ -32,7 +32,6 @@ The Agentics Orchestration Engine is a **conductor, not an engine**. It receives
 - **Delegation** to downstream Agentics Cores (Security, Data, Governance, Automation)
 - **Span propagation** under Ruvector's root span for distributed tracing
 - **Execution graph collation** from core responses
-- **Event-driven listening** for `plan_approved` decisions from Ruvector
 
 ### What this service does NOT do
 
@@ -42,6 +41,9 @@ The Agentics Orchestration Engine is a **conductor, not an engine**. It receives
 - Compute costs (LLM-Data-Core does)
 - Validate governance (LLM-Governance-Core does)
 - Generate artifacts (LLM-Automation-Core does)
+- Subscribe to or publish `plan_approved` decisions — this is a **synchronous
+  delegation service**. Per ADR-0001, `agentics-execution-engine` is the sole
+  subscriber and ruvector-service the sole publisher.
 
 ## Architecture
 
@@ -49,26 +51,23 @@ The Agentics Orchestration Engine is a **conductor, not an engine**. It receives
                          ┌──────────────────────┐
                          │      Ruvector         │
                          │  (execution substrate)│
-                         └──────┬───────┬───────┘
-                        accept  │       │  plan_approved
-                        ────────┘       └────────
-                                │       │
-              ┌─────────────────┴───────┴──────────────────┐
+                         └───────────┬──────────┘
+                                     │  accept
+                                     │  (blocking)
+              ┌──────────────────────┴─────────────────────┐
               │         Agentics Orchestration Engine       │
               │                                            │
-              │  ┌────────────┐       ┌─────────────────┐  │
-              │  │ HTTP API   │       │ Event Listener  │  │
-              │  │ (server)   │       │ (startup)       │  │
-              │  │            │       │                 │  │
-              │  │ POST       │       │ Subscribes to   │  │
-              │  │ /v1/simulate       │ plan_approved   │  │
-              │  └─────┬──────┘       └────────┬────────┘  │
-              │        │                       │           │
-              │        └───────┬───────────────┘           │
-              │                │                           │
-              │     ┌──────────┴──────────┐                │
-              │     │  OrchestrationEngine │                │
-              │     │  (pure delegation)   │                │
+              │            ┌────────────┐                  │
+              │            │ HTTP API   │                  │
+              │            │ (server)   │                  │
+              │            │            │                  │
+              │            │ POST       │                  │
+              │            │ /v1/simulate                  │
+              │            └─────┬──────┘                  │
+              │                  │                         │
+              │     ┌────────────┴─────────┐               │
+              │     │  OrchestrationEngine │               │
+              │     │  (pure delegation)   │               │
               │     └──────────┬──────────┘                │
               └────────────────┼───────────────────────────┘
                                │
@@ -83,14 +82,18 @@ The Agentics Orchestration Engine is a **conductor, not an engine**. It receives
         └────────┘ └───────┘  └───────────┘ └────────────┘
 ```
 
-## Two-Service Deployment
+## Deployment
 
-This repo deploys as a **single Docker image with two entry points** on Google Cloud Run:
+This repo deploys as a **single Cloud Run service**:
 
 | Service | Cloud Run Name | Entry Point | Role |
 |---------|---------------|-------------|------|
 | HTTP API | `agentics-orchestration-engine` | `node dist/server.js` | Handles REST requests, validates contracts, orchestrates via Ruvector |
-| Event Listener | `agentics-orchestration-engine-listener` | `node dist/ruvector/startup.js` | Subscribes to `plan_approved` events, triggers orchestration |
+
+> **ADR-0001.** The former `agentics-orchestration-engine-listener` service
+> (`node dist/ruvector/startup.js`) is retired and **must be undeployed**. This
+> service no longer subscribes to `plan_approved`; `agentics-execution-engine`
+> is the sole subscriber.
 
 ## Quick Start
 
@@ -110,11 +113,7 @@ npm test
 ### Run locally
 
 ```bash
-# HTTP API server
 npm start
-
-# Event listener
-npm run start:listener
 ```
 
 ### Docker
@@ -122,12 +121,13 @@ npm run start:listener
 ```bash
 docker build -t agentics-orchestration-engine .
 
-# Run API server
-docker run -p 8080:8080 agentics-orchestration-engine
-
-# Run event listener
-docker run -e RUVECTOR_ENDPOINT=https://ruvector.example.com \
-  agentics-orchestration-engine node dist/ruvector/startup.js
+docker run -p 8080:8080 \
+  -e RUVECTOR_SERVICE_URL=https://ruvector.example.com \
+  -e SECURITY_CORE_URL=https://security-core.example.com \
+  -e DATA_CORE_URL=https://data-core.example.com \
+  -e GOVERNANCE_CORE_URL=https://governance-core.example.com \
+  -e AUTOMATION_CORE_URL=https://automation-core.example.com \
+  agentics-orchestration-engine
 ```
 
 ## API Reference
@@ -280,17 +280,6 @@ with a non-zero status naming the missing variable rather than starting up and
 delegating to mocks. There is no mock fallback in any server-reachable path —
 `npm run check:no-mock-cores` enforces this.
 
-### Event Listener Service
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RUVECTOR_ENDPOINT` | **Yes** | -- | Ruvector API endpoint |
-| `RUVECTOR_API_KEY` | **Yes** | -- | API key for authentication |
-| `RUVECTOR_MODE` | No | `polling` | `polling` or `streaming` |
-| `RUVECTOR_POLL_INTERVAL_MS` | No | `5000` | Polling interval (ms) |
-| `ENGINE_ID` | No | auto-generated | Engine identifier |
-| `MAX_CONCURRENT_EXECUTIONS` | No | `5` | Concurrency limit |
-
 ## Project Structure
 
 ```
@@ -302,9 +291,7 @@ src/
 ├── core/
 │   └── engine.ts          # OrchestrationEngine (pure delegation)
 ├── ruvector/              # Ruvector integration
-│   ├── client.ts          # RuvectorClient (connect, poll, emit)
-│   ├── execution-listener.ts  # Event-driven listener (Service B)
-│   ├── startup.ts         # Listener entry point (Service B)
+│   ├── client.ts          # RuvectorClient (acceptance, lifecycle events)
 │   ├── idempotency.ts     # Idempotency guard
 │   └── types.ts           # Decision event types, acceptance protocol
 ├── integration/
@@ -325,7 +312,6 @@ packages/
 ```bash
 gcloud config set project agentics-dev
 
-# Deploy HTTP API
 gcloud run deploy agentics-orchestration-engine \
   --source . \
   --region us-central1 \
@@ -335,17 +321,12 @@ gcloud run deploy agentics-orchestration-engine \
   --cpu 1 \
   --timeout 300 \
   --port 8080
+```
 
-# Deploy Event Listener
-gcloud run deploy agentics-orchestration-engine-listener \
-  --source . \
-  --region us-central1 \
-  --platform managed \
-  --no-allow-unauthenticated \
-  --min-instances 1 \
-  --timeout 3600 \
-  --command node \
-  --args dist/ruvector/startup.js
+The former `agentics-orchestration-engine-listener` service must be undeployed:
+
+```bash
+gcloud run services delete agentics-orchestration-engine-listener --region us-central1
 ```
 
 ### Live Endpoints

@@ -100,6 +100,12 @@ export interface BaseDecisionEvent<TType extends DecisionEventType = DecisionEve
 /**
  * Event emitted when a plan is approved for execution.
  * This is the authoritative event shape from Ruvector.
+ *
+ * This service neither publishes nor subscribes to the event (ADR-0001). The
+ * definition survives here only because ADR-0001 step 8 — moving it to
+ * agentics-contracts as `events/v1/plan-approved.schema.json`, where it becomes
+ * the canonical basis for all three repos — is blocked on ADR-0002. Delete the
+ * local copy once the contract package ships.
  */
 export interface PlanApprovedEvent extends BaseDecisionEvent<'plan_approved'> {
   /** Required simulation ID for execution */

@@ -8,7 +8,6 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "start:listener": "node dist/ruvector/startup.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
