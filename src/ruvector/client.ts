@@ -1,23 +1,24 @@
 /**
  * Ruvector Client.
  *
- * Client for connecting to Ruvector, subscribing to decision events,
- * and emitting execution lifecycle events.
+ * Client for requesting execution acceptance from Ruvector and emitting
+ * execution lifecycle events.
+ *
+ * This client does NOT subscribe to decision events. Per ADR-0001 this service
+ * is a synchronous delegation service: agentics-execution-engine is the sole
+ * subscriber and ruvector-service the sole publisher.
  *
  * @module ruvector/client
  */
 
 import type { ISOTimestamp } from '../types/common.js';
 import type {
-  DecisionEvent,
   ExecutionLifecycleEvent,
   ExecutionAcceptanceRequest,
   ExecutionAcceptanceResponse,
   RuvectorClientConfig,
   RuvectorConnectionStatus,
-  RuvectorEventId,
 } from './types.js';
-import { createRuvectorEventId } from './types.js';
 
 // ============================================================================
 // SECRET MANAGER INTERFACE
@@ -84,11 +85,6 @@ export class RuvectorClientError extends Error {
 // ============================================================================
 
 /**
- * Listener for decision events.
- */
-export type DecisionEventListener = (event: DecisionEvent) => void | Promise<void>;
-
-/**
  * Listener for connection status changes.
  */
 export type ConnectionStatusListener = (status: RuvectorConnectionStatus) => void;
@@ -102,20 +98,17 @@ export type ConnectionStatusListener = (status: RuvectorConnectionStatus) => voi
  *
  * Handles:
  * - Connection management with authentication
- * - Subscribing to decision events (polling or streaming)
+ * - Requesting execution acceptance
  * - Emitting execution lifecycle events
  * - Connection health monitoring
  */
 export class RuvectorClient {
   private readonly config: RuvectorClientConfig;
   private readonly secretManager: SecretManager;
-  private readonly eventListeners: Set<DecisionEventListener> = new Set();
   private readonly statusListeners: Set<ConnectionStatusListener> = new Set();
 
   private credentials?: string;
-  private pollIntervalHandle?: ReturnType<typeof setInterval>;
   private isConnected: boolean = false;
-  private lastEventId?: RuvectorEventId;
 
   private status: RuvectorConnectionStatus = {
     connected: false,
@@ -165,13 +158,6 @@ export class RuvectorClient {
       lastConnectedAt: new Date().toISOString() as ISOTimestamp,
     });
 
-    // Start subscription based on mode
-    if (this.config.mode === 'polling') {
-      this.startPolling();
-    } else {
-      await this.startStreaming();
-    }
-
     console.log('[RuvectorClient] Connected successfully');
   }
 
@@ -181,29 +167,11 @@ export class RuvectorClient {
   async disconnect(): Promise<void> {
     console.log('[RuvectorClient] Disconnecting...');
 
-    if (this.pollIntervalHandle) {
-      clearInterval(this.pollIntervalHandle);
-      this.pollIntervalHandle = undefined;
-    }
-
     this.isConnected = false;
     this.credentials = undefined;
     this.updateStatus({ connected: false });
 
     console.log('[RuvectorClient] Disconnected');
-  }
-
-  /**
-   * Subscribes to decision events.
-   *
-   * @param listener - Event listener function
-   * @returns Unsubscribe function
-   */
-  onDecisionEvent(listener: DecisionEventListener): () => void {
-    this.eventListeners.add(listener);
-    return () => {
-      this.eventListeners.delete(listener);
-    };
   }
 
   /**
@@ -369,157 +337,6 @@ export class RuvectorClient {
     } finally {
       clearTimeout(timeoutId);
     }
-  }
-
-  /**
-   * Starts polling for events.
-   */
-  private startPolling(): void {
-    const intervalMs = this.config.pollIntervalMs ?? 5000;
-
-    console.log(`[RuvectorClient] Starting polling (interval: ${intervalMs}ms)`);
-
-    // Initial poll
-    this.pollForEvents();
-
-    // Schedule recurring polls
-    this.pollIntervalHandle = setInterval(() => {
-      this.pollForEvents();
-    }, intervalMs);
-  }
-
-  /**
-   * Polls for new events from Ruvector.
-   */
-  private async pollForEvents(): Promise<void> {
-    if (!this.isConnected) return;
-
-    try {
-      const events = await this.fetchEvents();
-
-      for (const event of events) {
-        await this.handleEvent(event);
-      }
-    } catch (error) {
-      console.error('[RuvectorClient] Error polling for events:', error);
-      this.updateStatus({ errors: this.status.errors + 1 });
-    }
-  }
-
-  /**
-   * Fetches events from Ruvector.
-   */
-  private async fetchEvents(): Promise<DecisionEvent[]> {
-    const url = new URL(`${this.config.endpoint}/events/decisions`);
-
-    // Add cursor for pagination
-    if (this.lastEventId) {
-      url.searchParams.set('after', this.lastEventId);
-    }
-
-    // Filter for plan_approved events
-    url.searchParams.set('types', 'plan_approved');
-    url.searchParams.set('client_id', this.config.clientId);
-
-    const response = await fetch(url.toString(), {
-      method: 'GET',
-      headers: this.getAuthHeaders(),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch events: ${response.status} ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as { events: DecisionEvent[] };
-    return data.events ?? [];
-  }
-
-  /**
-   * Starts streaming events (SSE or WebSocket).
-   */
-  private async startStreaming(): Promise<void> {
-    console.log('[RuvectorClient] Starting event stream');
-
-    // Note: Full streaming implementation would use EventSource or WebSocket
-    // For now, fall back to polling with shorter interval
-    this.config.pollIntervalMs ?? 1000;
-    this.startPolling();
-  }
-
-  /**
-   * Normalizes a raw API event into a proper DecisionEvent.
-   *
-   * The Ruvector API may return events with identifiers nested inside
-   * a `payload` sub-object. This method extracts them to top-level
-   * fields and generates `event_id` if missing.
-   */
-  private normalizeRawEvent(raw: Record<string, unknown>): DecisionEvent {
-    console.log('[RuvectorClient] Raw event before parsing:', JSON.stringify(raw));
-
-    // Unwrap envelope: ruvector may nest the real event under payload, data, or send flat
-    const event = (raw['payload'] ?? raw['data'] ?? raw) as Record<string, unknown>;
-
-    const event_id = (event['event_id'] ?? raw['event_id'] ?? createRuvectorEventId(`evt-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`)) as RuvectorEventId;
-    const plan_id = event['plan_id'] ?? raw['plan_id'];
-    const simulation_id = event['simulation_id'] ?? raw['simulation_id'];
-    const type = (event['type'] ?? raw['type']) as string;
-    const timestamp = (event['timestamp'] ?? raw['timestamp'] ?? new Date().toISOString()) as ISOTimestamp;
-    const source = event['source'] ?? raw['source'];
-    const correlation_id = event['correlation_id'] ?? raw['correlation_id'];
-    const execution_profile = event['execution_profile'] ?? raw['execution_profile'];
-    const advisory = event['advisory'] ?? raw['advisory'];
-
-    return {
-      event_id,
-      type,
-      plan_id,
-      simulation_id,
-      timestamp,
-      ...(source !== undefined && { source }),
-      ...(correlation_id !== undefined && { correlation_id }),
-      ...(execution_profile !== undefined && { execution_profile }),
-      ...(advisory !== undefined && { advisory }),
-    } as DecisionEvent;
-  }
-
-  /**
-   * Handles an incoming decision event.
-   */
-  private async handleEvent(rawEvent: DecisionEvent): Promise<void> {
-    // Normalize: extract identifiers from payload if nested, generate event_id if missing
-    const event = this.normalizeRawEvent(rawEvent as unknown as Record<string, unknown>);
-
-    this.lastEventId = event.event_id;
-    this.updateStatus({
-      eventsReceived: this.status.eventsReceived + 1,
-      lastEventAt: new Date().toISOString() as ISOTimestamp,
-    });
-
-    console.log(`[RuvectorClient] Received event: ${event.type}`, {
-      event_id: event.event_id,
-      plan_id: event.plan_id,
-      simulation_id: event.simulation_id,
-    });
-
-    // Guard: reject events with missing identifiers before dispatching
-    if (!event.plan_id || !event.simulation_id) {
-      console.error('[RuvectorAcceptance] invalid event envelope', rawEvent);
-      this.updateStatus({ errors: this.status.errors + 1 });
-      return;
-    }
-
-    // Notify all listeners
-    for (const listener of this.eventListeners) {
-      try {
-        await listener(event);
-      } catch (error) {
-        console.error('[RuvectorClient] Error in event listener:', error);
-      }
-    }
-
-    this.updateStatus({
-      eventsProcessed: this.status.eventsProcessed + 1,
-    });
   }
 
   /**

@@ -17,7 +17,11 @@ import {
   OrchestrationError,
   type OrchestrationConfig,
 } from './core/engine.js';
-import { createMockCoreClientRegistry } from './integration/cores/mock-cores.js';
+import { createCoreClientRegistryFromEnv } from './integration/cores/http-cores.js';
+import {
+  resolveCoreEndpoints,
+  CoreConfigurationError,
+} from './integration/cores/core-endpoints.js';
 import type { SimulationConfig, SimulationResult } from './types/simulation.js';
 import type { Scenario } from './types/scenario.js';
 import type { ExecutionId, ISOTimestamp, SimulationId } from './types/common.js';
@@ -77,8 +81,9 @@ interface HealthResponse {
 }
 
 interface RunCreateResponse {
-  runId: string;
+  execution_id: string;
   status: 'accepted';
+  simulation_resolution?: string;
 }
 
 interface ExecutionMetadata {
@@ -607,7 +612,7 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 
     // Create orchestration engine and initialize with ruvector + core clients
     const ruvectorClient = createRuvectorClientFromEnv();
-    const coreClients = createMockCoreClientRegistry();
+    const coreClients = createCoreClientRegistryFromEnv();
     const engine = createOrchestrationEngine();
     engine.initialize(ruvectorClient, coreClients);
 
@@ -700,10 +705,12 @@ async function handleSimulate(req: IncomingMessage, res: ServerResponse): Promis
 // ============================================================================
 
 /**
- * POST /api/v1/runs — Create a new orchestration run.
+ * POST /api/v1/runs — Submit a run intent to Ruvector for acceptance.
  *
- * Generates a runId, publishes a plan_approved decision to Ruvector
- * so the execution engine listener picks it up, and returns 202.
+ * Ruvector is the sole authority for accepting execution and minting identity
+ * (agentics-enforcement ADR-004), so this handler mints nothing and declares
+ * nothing approved. It forwards the intent to Ruvector's accept endpoint and
+ * returns the Ruvector-minted execution_id.
  */
 async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== 'POST') {
@@ -724,49 +731,76 @@ async function handleCreateRun(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
 
-  const runId = `run-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-
-  console.log(`[POST /api/v1/runs] runId=${runId}`, JSON.stringify(body));
-
-  // Publish plan_approved decision to Ruvector so the execution listener reacts
   const ruvectorEndpoint = process.env['RUVECTOR_SERVICE_URL'];
   if (!ruvectorEndpoint) {
     sendGenericError(res, 500, 'RUVECTOR_NOT_CONFIGURED', 'RUVECTOR_SERVICE_URL is not defined');
     return;
   }
-  const decisionEvent = {
-    type: 'plan_approved',
-    runId,
-    source: 'orchestration',
-    timestamp: new Date().toISOString(),
-    payload: body,
-  };
 
-  const publishUrl = `${ruvectorEndpoint}/events/decisions`;
-  console.log(`[orchestration] publishing to ${publishUrl}`);
-
-  try {
-    const publishResponse = await fetch(publishUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(decisionEvent),
-    });
-
-    if (!publishResponse.ok) {
-      const detail = `${publishResponse.status} ${publishResponse.statusText}`;
-      console.error(`[orchestration] failed to publish plan_approved for runId=${runId}: ${detail}`);
-      sendGenericError(res, 500, 'RUVECTOR_PUBLISH_FAILED', `Failed to publish decision: ${detail}`);
-      return;
-    }
-
-    console.log(`[orchestration] published plan_approved for runId=${runId}`);
-  } catch (error) {
-    console.error(`[orchestration] failed to publish plan_approved for runId=${runId}:`, error);
-    sendGenericError(res, 500, 'RUVECTOR_PUBLISH_FAILED', error instanceof Error ? error.message : 'Failed to publish decision to Ruvector');
+  const intent = body as Record<string, unknown>;
+  const simulationId = intent['simulation_id'] ?? intent['simulationId'];
+  if (typeof simulationId !== 'string' || simulationId.length === 0) {
+    sendGenericError(res, 400, 'INVALID_BODY', 'simulation_id is required');
     return;
   }
 
-  const response: RunCreateResponse = { runId, status: 'accepted' };
+  const acceptancePayload = {
+    simulation_id: simulationId,
+    plan_id: intent['plan_id'] ?? intent['planId'] ?? simulationId,
+    simulation_resolution: intent['simulation_resolution'] ?? 'aggregate',
+    execution_metadata: {
+      source: SERVICE_NAME,
+      environment: process.env['ENVIRONMENT'] ?? process.env['NODE_ENV'] ?? 'production',
+      timestamp: new Date().toISOString(),
+    },
+  };
+
+  const acceptUrl = `${ruvectorEndpoint}/v1/accept`;
+  console.log(`[POST /api/v1/runs] submitting intent to ${acceptUrl}`, JSON.stringify(acceptancePayload));
+
+  let acceptance: Record<string, unknown>;
+  try {
+    const acceptResponse = await fetch(acceptUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        authorization: `Bearer ${process.env['PLATFORM_API_KEY']}`,
+      },
+      body: JSON.stringify(acceptancePayload),
+    });
+
+    if (!acceptResponse.ok) {
+      const detail = `${acceptResponse.status} ${acceptResponse.statusText}`;
+      console.error(`[orchestration] Ruvector acceptance request failed: ${detail}`);
+      sendGenericError(res, 502, 'RUVECTOR_ACCEPTANCE_FAILED', `Ruvector acceptance request failed: ${detail}`);
+      return;
+    }
+
+    acceptance = (await acceptResponse.json()) as Record<string, unknown>;
+  } catch (error) {
+    console.error('[orchestration] Ruvector acceptance request failed:', error);
+    sendGenericError(res, 503, 'RUVECTOR_UNAVAILABLE', error instanceof Error ? error.message : 'Ruvector is unreachable');
+    return;
+  }
+
+  const executionId = acceptance['execution_id'];
+  if (acceptance['accepted'] === false || typeof executionId !== 'string') {
+    const reason = typeof acceptance['rejection_reason'] === 'string'
+      ? acceptance['rejection_reason']
+      : 'Ruvector did not accept the run';
+    sendGenericError(res, 403, 'RUVECTOR_REJECTED', reason);
+    return;
+  }
+
+  console.log(`[orchestration] Ruvector accepted run execution_id=${executionId}`);
+
+  const response: RunCreateResponse = {
+    execution_id: executionId,
+    status: 'accepted',
+    ...(typeof acceptance['simulation_resolution'] === 'string' && {
+      simulation_resolution: acceptance['simulation_resolution'],
+    }),
+  };
   _sendJsonInternal(res, 202, response);
 }
 
@@ -858,6 +892,24 @@ try {
 }
 
 // ============================================================================
+// LAYER-3 CORE CONFIGURATION GUARD (fail closed)
+// ============================================================================
+
+let coreEndpoints: ReturnType<typeof resolveCoreEndpoints>;
+try {
+  coreEndpoints = resolveCoreEndpoints();
+  console.log('[cores] endpoints resolved');
+} catch (err) {
+  if (err instanceof CoreConfigurationError) {
+    console.error(`[cores] ${err.message}`);
+    console.error(`[cores] offending variables: ${err.variables.join(', ')}`);
+  } else {
+    console.error('[cores] endpoint resolution failed', err);
+  }
+  process.exit(1);
+}
+
+// ============================================================================
 // SERVER STARTUP
 // ============================================================================
 
@@ -878,6 +930,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`AGENTICS_ROLE=${process.env['AGENTICS_ROLE'] ?? 'orchestrator'}`);
   console.log(`AGENTICS_MODE=${process.env['AGENTICS_MODE'] ?? 'orchestration'}`);
   console.log(`Using RUVECTOR_SERVICE_URL: ${process.env['RUVECTOR_SERVICE_URL'] ?? '(NOT SET — will fail at runtime)'}`);
+  console.log(`Using SECURITY_CORE_URL: ${coreEndpoints.security}`);
+  console.log(`Using DATA_CORE_URL: ${coreEndpoints.data}`);
+  console.log(`Using GOVERNANCE_CORE_URL: ${coreEndpoints.governance}`);
+  console.log(`Using AUTOMATION_CORE_URL: ${coreEndpoints.automation}`);
   console.log(`Listening on port ${PORT}`);
   console.log(`Routes:`);
   console.log(`  GET  /health`);

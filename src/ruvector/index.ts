@@ -1,15 +1,9 @@
 /**
  * Ruvector Integration Module.
  *
- * Provides the event-driven execution bridge between plan approval
- * in agentics-deployment-intent and simulation execution.
- *
- * Key components:
- * - RuvectorClient: Connects to Ruvector for event subscription
- * - ExecutionListener: Listens for plan_approved events and triggers execution
- * - IdempotencyGuard: Prevents duplicate plan executions
- *
- * This module is the FINAL EXECUTION WIRING step.
+ * Provides this service's synchronous link to Ruvector: execution acceptance
+ * and lifecycle event emission. Per ADR-0001 this service does not subscribe
+ * to decision events — agentics-execution-engine is the sole subscriber.
  *
  * @module ruvector
  */
@@ -68,7 +62,6 @@ export {
 // Ruvector client
 export type {
   SecretManager,
-  DecisionEventListener,
   ConnectionStatusListener,
 } from './client.js';
 export {
@@ -78,19 +71,3 @@ export {
   createRuvectorClient,
   createConfigFromEnvironment,
 } from './client.js';
-
-// Execution listener
-export type {
-  SimulationResolver,
-  ExecutionListenerConfig,
-  ExecutionListenerStatus,
-  ExecutionEvent,
-  ExecutionEventListener,
-} from './execution-listener.js';
-export {
-  ExecutionListener,
-  createExecutionListener,
-  createExecutionListenerFromEnvironment,
-  InMemorySimulationResolver,
-  createInMemorySimulationResolver,
-} from './execution-listener.js';

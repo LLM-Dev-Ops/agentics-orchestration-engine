@@ -8,7 +8,6 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "start:listener": "node dist/ruvector/startup.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -16,7 +15,8 @@
     "test:unit": "vitest run test/unit",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
-    "validate": "npm run typecheck && npm run lint && npm run test"
+    "check:no-mock-cores": "node scripts/check-no-mock-cores.mjs",
+    "validate": "npm run typecheck && npm run lint && npm run check:no-mock-cores && npm run test"
   },
   "keywords": [
     "simulation",
